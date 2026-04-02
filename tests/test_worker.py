@@ -1,0 +1,230 @@
+"""Tests for Worker request handling and routing."""
+
+import time
+import unittest
+import multiprocessing as mp
+
+from uhttp.workers import Worker, Request, Response, api, MSG_RESPONSE, MSG_HEARTBEAT
+
+
+class SimpleWorker(Worker):
+    @api('/items', 'GET')
+    def list_items(self, request):
+        return {'items': [1, 2, 3]}
+
+    @api('/items', 'POST')
+    def create_item(self, request):
+        return {'created': request.data}, 201
+
+    @api('/item/{id:int}', 'GET')
+    def get_item(self, request):
+        return {'id': request.path_params['id']}
+
+    @api('/item/{id:int}', 'DELETE')
+    def delete_item(self, request):
+        return {'deleted': request.path_params['id']}
+
+    @api('/fail', 'GET')
+    def fail(self, request):
+        raise ValueError("test error")
+
+
+class TestWorkerHandleRequest(unittest.TestCase):
+
+    def setUp(self):
+        queues = [mp.Queue() for _ in range(3)]
+        self.worker = SimpleWorker(0, *queues)
+        self.worker._build_routes()
+
+    def test_get_items(self):
+        req = Request(1, 'GET', '/items')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.data, {'items': [1, 2, 3]})
+
+    def test_post_items(self):
+        req = Request(2, 'POST', '/items', data={'name': 'test'})
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 201)
+        self.assertEqual(resp.data, {'created': {'name': 'test'}})
+
+    def test_get_item_with_param(self):
+        req = Request(3, 'GET', '/item/42')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.data, {'id': 42})
+
+    def test_delete_item(self):
+        req = Request(4, 'DELETE', '/item/7')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.data, {'deleted': 7})
+
+    def test_not_found(self):
+        req = Request(5, 'GET', '/nonexistent')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 404)
+        self.assertIn('error', resp.data)
+
+    def test_method_not_allowed(self):
+        req = Request(6, 'PUT', '/items')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 405)
+        self.assertIn('Allow', resp.headers)
+
+    def test_handler_exception(self):
+        req = Request(7, 'GET', '/fail')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 500)
+        self.assertIn('error', resp.data)
+        self.assertIn('test error', resp.data['error'])
+
+    def test_response_has_request_id(self):
+        req = Request(99, 'GET', '/items')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.request_id, 99)
+
+    def test_int_param_invalid(self):
+        req = Request(8, 'GET', '/item/abc')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 404)
+
+    def test_method_not_allowed_on_param_route(self):
+        req = Request(9, 'POST', '/item/42')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 405)
+
+
+class TestWorkerMatchRoute(unittest.TestCase):
+
+    def setUp(self):
+        queues = [mp.Queue() for _ in range(3)]
+        self.worker = SimpleWorker(0, *queues)
+        self.worker._build_routes()
+
+    def test_match_sets_path_params(self):
+        req = Request(1, 'GET', '/item/42')
+        handler = self.worker._match_route(req)
+        self.assertIsNotNone(handler)
+        self.assertEqual(req.path_params, {'id': 42})
+
+    def test_no_match_returns_none(self):
+        req = Request(1, 'GET', '/nonexistent')
+        handler = self.worker._match_route(req)
+        self.assertIsNone(handler)
+
+    def test_wrong_method_returns_none(self):
+        req = Request(1, 'PATCH', '/items')
+        handler = self.worker._match_route(req)
+        self.assertIsNone(handler)
+
+
+class ConfigWorker(Worker):
+    config_received = None
+
+    def on_config(self, config):
+        ConfigWorker.config_received = config
+
+
+class TestWorkerProcessControl(unittest.TestCase):
+
+    def test_stop_via_run(self):
+        """Worker stops when None is received on control queue."""
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        control_queue.put(None)
+        worker = SimpleWorker(0, request_queue, control_queue, response_queue)
+        worker.heartbeat_interval = 0.1
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+
+    def test_config_via_run(self):
+        """Worker receives config message."""
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        control_queue.put(('CONFIG', {'key': 'value'}))
+        control_queue.put(None)  # stop after config
+        worker = ConfigWorker(0, request_queue, control_queue, response_queue)
+        worker.heartbeat_interval = 0.1
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+
+
+class SetupWorker(Worker):
+    def setup(self):
+        # signal setup was called by sending a message
+        self._response_queue.put(('SETUP_DONE', self.worker_id, None))
+
+
+class TestWorkerRunLoop(unittest.TestCase):
+
+    def test_processes_request_and_stops(self):
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        worker = SimpleWorker(
+            0, request_queue, control_queue, response_queue)
+        worker.heartbeat_interval = 0.1
+        # put request — control stop will be sent after we see response
+        request_queue.put(Request(1, 'GET', '/items'))
+        worker.start()
+        # wait for response
+        found_response = False
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                msg = response_queue.get(timeout=0.5)
+            except Exception:
+                continue
+            if msg[0] == MSG_RESPONSE:
+                _, req_id, resp = msg
+                self.assertEqual(req_id, 1)
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.data, {'items': [1, 2, 3]})
+                found_response = True
+                break
+        self.assertTrue(found_response)
+        control_queue.put(None)
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+
+    def test_heartbeat_on_idle(self):
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        worker = SimpleWorker(
+            0, request_queue, control_queue, response_queue)
+        worker.heartbeat_interval = 0.1
+        worker.start()
+        # wait for at least one heartbeat
+        msg = response_queue.get(timeout=3)
+        self.assertEqual(msg[0], MSG_HEARTBEAT)
+        self.assertIsNone(msg[1])  # pool_name (not set)
+        self.assertEqual(msg[2], 0)  # worker_id
+        self.assertIsNone(msg[3])  # no request_id
+        # stop
+        control_queue.put(None)
+        worker.join(timeout=5)
+
+    def test_setup_called(self):
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        worker = SetupWorker(
+            0, request_queue, control_queue, response_queue)
+        worker.heartbeat_interval = 0.1
+        worker.start()
+        # wait for setup signal
+        msg = response_queue.get(timeout=5)
+        self.assertEqual(msg[0], 'SETUP_DONE')
+        control_queue.put(None)
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+
+
+if __name__ == '__main__':
+    unittest.main()

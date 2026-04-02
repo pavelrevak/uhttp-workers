@@ -1,0 +1,8 @@
+*.egg-info
+__pycache__
+*.pyc
+.*
+!.gitignore
+!.github
+*.md
+!README*.md

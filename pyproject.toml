@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uhttp-workers"
+dynamic = ["version"]
+description = "Multi-process worker dispatcher built on uhttp-server"
+readme = "README.md"
+authors = [
+    {name = "Pavel Revak", email = "pavelrevak@gmail.com"}
+]
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "uhttp-server",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX",
+]
+
+[project.urls]
+Homepage = "https://github.com/pavelrevak/uhttp"
+Repository = "https://github.com/pavelrevak/uhttp"
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
+
+[tool.setuptools.packages.find]
+include = ["uhttp*"]

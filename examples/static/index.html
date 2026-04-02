@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>uhttp-workers demo</title>
+    <style>
+        body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+        pre { background: #f4f4f4; padding: 12px; border-radius: 4px; overflow-x: auto; }
+        button { margin: 4px; padding: 6px 12px; cursor: pointer; }
+        #output { white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>uhttp-workers demo</h1>
+
+    <h2>Sync handlers</h2>
+    <button onclick="call('/health')">GET /health</button>
+    <button onclick="call('/version')">GET /version</button>
+
+    <h2>Compute workers</h2>
+    <button onclick="call('/api/compute/factorial/10')">factorial(10)</button>
+    <button onclick="call('/api/compute/factorial/100')">factorial(100)</button>
+    <button onclick="callPost('/api/compute/echo', {message: 'hello'})">echo</button>
+
+    <h2>Storage workers</h2>
+    <button onclick="call('/api/items')">list items</button>
+    <button onclick="callPost('/api/items', {name: 'test item'})">create item</button>
+    <button onclick="call('/api/item/1')">get item 1</button>
+    <button onclick="callDelete('/api/item/1')">delete item 1</button>
+
+    <h2>Response</h2>
+    <pre id="output">click a button...</pre>
+
+    <script>
+        const KEY = 'demo-key-1';
+        const out = document.getElementById('output');
+
+        async function call(path) {
+            const res = await fetch(path, {headers: {'x-api-key': KEY}});
+            out.textContent = `${res.status} ${res.statusText}\n\n` +
+                JSON.stringify(await res.json(), null, 2);
+        }
+
+        async function callPost(path, data) {
+            const res = await fetch(path, {
+                method: 'POST',
+                headers: {'x-api-key': KEY, 'Content-Type': 'application/json'},
+                body: JSON.stringify(data),
+            });
+            out.textContent = `${res.status} ${res.statusText}\n\n` +
+                JSON.stringify(await res.json(), null, 2);
+        }
+
+        async function callDelete(path) {
+            const res = await fetch(path, {
+                method: 'DELETE',
+                headers: {'x-api-key': KEY},
+            });
+            out.textContent = `${res.status} ${res.statusText}\n\n` +
+                JSON.stringify(await res.json(), null, 2);
+        }
+    </script>
+</body>
+</html>
