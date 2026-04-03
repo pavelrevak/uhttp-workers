@@ -255,6 +255,7 @@ def process(self, request):
     # request.query        — {'page': '1'} or None
     # request.data         — dict (JSON), bytes (binary), or None
     # request.headers      — dict
+    # request.cookies      — dict (lazy-parsed from Cookie header)
     # request.content_type — 'application/json'
 
     # return data (status 200)
@@ -300,6 +301,43 @@ class MyDispatcher(_workers.Dispatcher):
 ```
 
 `do_check()` is only called for requests going to worker pools — static files and sync handlers are not affected.
+
+### Worker-Level Validation
+
+Override `do_check()` on the worker — runs before routing to handler:
+
+```python
+class MyWorker(_workers.Worker):
+    def do_check(self, request):
+        token = request.cookies.get('session')
+        if not token:
+            return {'error': 'unauthorized'}, 401
+```
+
+Return `(data, status)` tuple to reject, or `None` to continue. You can also raise `RejectRequest`:
+
+```python
+    def do_check(self, request):
+        if not self.validate_token(request.cookies.get('session')):
+            raise _workers.RejectRequest(
+                data={'error': 'forbidden'}, status=403)
+```
+
+`RejectRequest` accepts optional `data` (default: `{'error': 'Rejected'}`) and `status` (default: `403`).
+
+### Error Handling
+
+Override `on_request_error()` on the worker to customize error handling when a request handler raises an exception:
+
+```python
+class MyWorker(_workers.Worker):
+    def on_request_error(self, request, err):
+        if isinstance(err, DatabaseError):
+            self.db.reconnect()
+        return super().on_request_error(request, err)
+```
+
+Default behavior logs the error with traceback and returns 500.
 
 ## Post-Response Hook
 
@@ -379,6 +417,15 @@ class MyWorker(_workers.Worker):
 Log messages are sent to the dispatcher via the shared response queue and printed in the dispatcher process — no interleaved output from multiple processes.
 
 **Log levels:** `LOG_DEBUG` (10), `LOG_INFO` (20), `LOG_WARNING` (30), `LOG_ERROR` (40), `LOG_CRITICAL` (50)
+
+Check current level with `is_*` properties to skip expensive formatting:
+
+```python
+if self.log.is_debug:
+    self.log.debug("Details: %s", expensive_computation())
+```
+
+Available: `is_debug`, `is_info`, `is_warning`, `is_error`.
 
 Set minimum level per pool:
 

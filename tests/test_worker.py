@@ -4,7 +4,9 @@ import time
 import unittest
 import multiprocessing as mp
 
-from uhttp.workers import Worker, Request, Response, api, MSG_RESPONSE, MSG_HEARTBEAT
+from uhttp.workers import (
+    Worker, Request, Response, api, RejectRequest,
+    MSG_RESPONSE, MSG_HEARTBEAT)
 
 
 class SimpleWorker(Worker):
@@ -93,6 +95,101 @@ class TestWorkerHandleRequest(unittest.TestCase):
         req = Request(9, 'POST', '/item/42')
         resp = self.worker._handle_request(req)
         self.assertEqual(resp.status, 405)
+
+
+class CheckWorker(Worker):
+    """Worker with do_check that rejects unauthorized requests."""
+
+    def do_check(self, request):
+        token = request.cookies.get('session')
+        if not token:
+            return {'error': 'unauthorized'}, 401
+
+    @api('/secret', 'GET')
+    def secret(self, request):
+        return {'data': 'secret'}
+
+
+class RejectWorker(Worker):
+    """Worker with do_check that raises RejectRequest."""
+
+    def do_check(self, request):
+        raise RejectRequest()
+
+    @api('/data', 'GET')
+    def data(self, request):
+        return {'data': 'ok'}
+
+
+class FailCheckWorker(Worker):
+    """Worker with do_check that raises unexpected exception."""
+
+    def do_check(self, request):
+        raise RuntimeError("check failed")
+
+    @api('/data', 'GET')
+    def data(self, request):
+        return {'data': 'ok'}
+
+
+class TestWorkerDoCheck(unittest.TestCase):
+
+    def test_do_check_reject(self):
+        queues = [mp.Queue() for _ in range(3)]
+        worker = CheckWorker(0, *queues)
+        worker._build_routes()
+        req = Request(1, 'GET', '/secret')
+        resp = worker._handle_request(req)
+        self.assertEqual(resp.status, 401)
+
+    def test_do_check_pass(self):
+        queues = [mp.Queue() for _ in range(3)]
+        worker = CheckWorker(0, *queues)
+        worker._build_routes()
+        req = Request(1, 'GET', '/secret',
+            headers={'cookie': 'session=abc123'})
+        resp = worker._handle_request(req)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.data, {'data': 'secret'})
+
+    def test_do_check_reject_request(self):
+        queues = [mp.Queue() for _ in range(3)]
+        worker = RejectWorker(0, *queues)
+        worker._build_routes()
+        req = Request(1, 'GET', '/data')
+        resp = worker._handle_request(req)
+        self.assertEqual(resp.status, 403)
+
+    def test_do_check_exception(self):
+        queues = [mp.Queue() for _ in range(3)]
+        worker = FailCheckWorker(0, *queues)
+        worker._build_routes()
+        req = Request(1, 'GET', '/data')
+        resp = worker._handle_request(req)
+        self.assertEqual(resp.status, 500)
+
+
+class TestRequestCookies(unittest.TestCase):
+
+    def test_cookies_parsed(self):
+        req = Request(1, 'GET', '/',
+            headers={'cookie': 'session=abc; user=john'})
+        self.assertEqual(req.cookies, {'session': 'abc', 'user': 'john'})
+
+    def test_cookies_empty(self):
+        req = Request(1, 'GET', '/')
+        self.assertEqual(req.cookies, {})
+
+    def test_cookies_no_cookie_header(self):
+        req = Request(1, 'GET', '/', headers={'content-type': 'text/html'})
+        self.assertEqual(req.cookies, {})
+
+    def test_cookies_cached(self):
+        req = Request(1, 'GET', '/',
+            headers={'cookie': 'a=1'})
+        c1 = req.cookies
+        c2 = req.cookies
+        self.assertIs(c1, c2)
 
 
 class TestWorkerMatchRoute(unittest.TestCase):

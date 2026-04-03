@@ -69,7 +69,11 @@ class ApiException(Exception):
 
 
 class RejectRequest(ApiException):
-    """Raised in do_check() to reject request (response already sent)."""
+    """Raised in do_check() to reject request with custom status/data."""
+
+    def __init__(self, data=None, status=403):
+        self.data = data if data is not None else {'error': 'Rejected'}
+        self.status = status
 
 
 # Route decorator
@@ -199,7 +203,8 @@ class Request:
 
     __slots__ = (
         'request_id', 'method', 'path', 'query',
-        'data', 'headers', 'content_type', 'path_params')
+        'data', 'headers', 'content_type', 'path_params',
+        '_cookies')
 
     def __init__(
             self, request_id, method, path, query=None,
@@ -212,6 +217,16 @@ class Request:
         self.headers = headers or {}
         self.content_type = content_type
         self.path_params = {}
+        self._cookies = None
+
+    @property
+    def cookies(self):
+        """Cookies dict, parsed from Cookie header."""
+        if self._cookies is None:
+            raw = self.headers.get('cookie', '')
+            self._cookies = (
+                _uhttp_server.parse_cookies(raw) if raw else {})
+        return self._cookies
 
 
 class Response:
@@ -270,6 +285,22 @@ class Logger:
         self.name = name
         self.level = level
         self._queue = queue
+
+    @property
+    def is_debug(self):
+        return self.level <= LOG_DEBUG
+
+    @property
+    def is_info(self):
+        return self.level <= LOG_INFO
+
+    @property
+    def is_warning(self):
+        return self.level <= LOG_WARNING
+
+    @property
+    def is_error(self):
+        return self.level <= LOG_ERROR
 
     def _log(self, level, msg, *args, **kwargs):
         if level >= self.level:
@@ -453,8 +484,37 @@ class Worker(_mp.Process):
             if isinstance(msg, tuple) and msg[0] == CTL_CONFIG:
                 self.on_config(msg[1])
 
+    def do_check(self, request):
+        """Validation hook called before routing request to handler.
+
+        Override for authentication, session validation, etc.
+        Raise RejectRequest to reject with custom response.
+
+        Args:
+            request: Request object with headers, cookies, etc.
+
+        Returns:
+            None to continue, or (data, status) tuple to reject.
+        """
+
     def _handle_request(self, request):
         """Route and handle a single request, return Response."""
+        try:
+            result = self.do_check(request)
+            if result is not None:
+                data, status = result
+                return Response(request.request_id, data=data, status=status)
+        except RejectRequest as err:
+            return Response(
+                request.request_id,
+                data=err.data,
+                status=err.status)
+        except Exception as err:
+            self.log.error("do_check: %s\n%s", err, _traceback.format_exc())
+            return Response(
+                request.request_id,
+                data={'error': 'Internal server error'},
+                status=500)
         handler = self._match_route(request)
         if handler is None:
             # check if path matches but method doesn't
@@ -477,14 +537,22 @@ class Worker(_mp.Process):
                 data, status = result, 200
             return Response(request.request_id, data=data, status=status)
         except Exception as err:
-            self.log.error(
-                "%s %s: %s\n%s",
-                request.method, request.path, err,
-                _traceback.format_exc())
-            return Response(
-                request.request_id,
-                data={'error': str(err)},
-                status=500)
+            return self.on_request_error(request, err)
+
+    def on_request_error(self, request, err):
+        """Called when request handler raises an exception.
+
+        Override to customize error handling (e.g., DB reconnect).
+        Default logs the error with traceback and returns 500 response.
+        """
+        self.log.error(
+            "%s %s: %s\n%s",
+            request.method, request.path, err,
+            _traceback.format_exc())
+        return Response(
+            request.request_id,
+            data={'error': str(err)},
+            status=500)
 
     def run(self):
         """Worker main loop using select for multiplexing."""
