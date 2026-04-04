@@ -378,6 +378,7 @@ class Worker(_mp.Process):
         self._handlers = []
         self._readers = {}
         self._writers = {}
+        self._current_request_id = None
         self._running = True
 
     def _build_routes(self):
@@ -454,6 +455,16 @@ class Worker(_mp.Process):
         Override to initialize resources (database connections, models, etc.).
         Extra kwargs from WorkerPool are available as self.kwargs.
         """
+
+    def keep_alive(self):
+        """Signal dispatcher that worker is still processing.
+
+        Call during long operations to prevent request timeout (504)
+        and stuck worker detection.
+        """
+        self._response_queue.put(
+            (MSG_HEARTBEAT, self.pool_name,
+             self.worker_id, self._current_request_id))
 
     def on_idle(self):
         """Called on each heartbeat interval when no request arrived.
@@ -605,9 +616,11 @@ class Worker(_mp.Process):
                     continue
                 except (EOFError, OSError):
                     break
+                self._current_request_id = request.request_id
                 self._response_queue.put(
                     (MSG_HEARTBEAT, self.pool_name, self.worker_id, request.request_id))
                 response = self._handle_request(request)
+                self._current_request_id = None
                 self._response_queue.put(
                     (MSG_RESPONSE, request.request_id, response))
 
@@ -1037,6 +1050,10 @@ class Dispatcher:
                 if pool.name == pool_name:
                     pool.update_heartbeat(worker_id, request_id)
                     break
+            if request_id is not None:
+                pending = self._pending.get(request_id)
+                if pending is not None:
+                    pending.timestamp = _time.time()
         elif msg_type == MSG_LOG:
             _, name, level, message = msg
             self.on_log(name, level, message)
@@ -1103,7 +1120,13 @@ class Dispatcher:
         level_name = LOG_LEVEL_NAMES.get(level, str(level))
         if self._log_is_tty:
             color = _LOG_ANSI_COLOR.get(level, '')
-            print(f"{color}{level_name:8s} {name:20s} {message}{_ANSI_RESET}",
+            t = _time.time()
+            ts = _time.strftime(
+                '%Y-%m-%d %H:%M:%S', _time.localtime(t)) + \
+                f'.{int(t * 1000) % 1000:03d}'
+            print(
+                f"{color}{ts} {level_name:8s} {name:20s} "
+                f"{message}{_ANSI_RESET}",
                 file=_sys.stderr)
         else:
             prefix = _LOG_SYSLOG_PREFIX.get(level, '')
@@ -1153,9 +1176,9 @@ class Dispatcher:
                 http_read, http_write)
             if client:
                 self._http_request(client)
-        # periodic maintenance (on timeout — no events)
+        # periodic maintenance
+        self._check_all_workers()
         if not read_events and not write_events:
-            self._check_all_workers()
             self.on_idle()
         # always check expired requests
         self._expire_pending()
