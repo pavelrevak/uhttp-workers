@@ -25,6 +25,9 @@ MSG_LOG = 'LOG'
 CTL_STOP = 'STOP'
 CTL_CONFIG = 'CONFIG'
 
+# Sentinel for deferred response
+DEFERRED = object()
+
 # Log levels
 LOG_CRITICAL = 50
 LOG_ERROR = 40
@@ -204,7 +207,7 @@ class Request:
     __slots__ = (
         'request_id', 'method', 'path', 'query',
         'data', 'headers', 'content_type', 'path_params',
-        '_cookies')
+        '_cookies', '_response_queue')
 
     def __init__(
             self, request_id, method, path, query=None,
@@ -218,6 +221,7 @@ class Request:
         self.content_type = content_type
         self.path_params = {}
         self._cookies = None
+        self._response_queue = None
 
     @property
     def cookies(self):
@@ -227,6 +231,15 @@ class Request:
             self._cookies = (
                 _uhttp_server.parse_cookies(raw) if raw else {})
         return self._cookies
+
+    def respond(self, data=None, status=200):
+        """Send deferred response for this request.
+
+        Use after returning DEFERRED from handler.
+        """
+        self._response_queue.put(
+            (MSG_RESPONSE, self.request_id,
+             Response(self.request_id, data=data, status=status)))
 
 
 class Response:
@@ -542,6 +555,8 @@ class Worker(_mp.Process):
                 status=404)
         try:
             result = handler(request)
+            if result is DEFERRED:
+                return None
             if isinstance(result, tuple):
                 data, status = result
             else:
@@ -601,14 +616,19 @@ class Worker(_mp.Process):
                 if not self._running:
                     break
             # custom writers
+            has_custom = False
             for fd in writable:
                 if fd in self._writers:
                     self._writers[fd](fd)
+                    has_custom = True
             # custom readers
             for fd in readable:
                 if fd in self._readers:
                     self._readers[fd](fd)
-            # request from dispatcher
+                    has_custom = True
+            # request from dispatcher (skip if custom fd had events)
+            if has_custom:
+                continue
             if req_reader in readable:
                 try:
                     request = self._request_queue.get_nowait()
@@ -616,13 +636,15 @@ class Worker(_mp.Process):
                     continue
                 except (EOFError, OSError):
                     break
+                request._response_queue = self._response_queue
                 self._current_request_id = request.request_id
                 self._response_queue.put(
                     (MSG_HEARTBEAT, self.pool_name, self.worker_id, request.request_id))
                 response = self._handle_request(request)
                 self._current_request_id = None
-                self._response_queue.put(
-                    (MSG_RESPONSE, request.request_id, response))
+                if response is not None:
+                    self._response_queue.put(
+                        (MSG_RESPONSE, request.request_id, response))
 
 
 # Worker Pool

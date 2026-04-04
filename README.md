@@ -263,6 +263,43 @@ def process(self, request):
 
     # return data with status
     return {'error': 'not found'}, 404
+
+    # defer response — worker continues accepting requests
+    return _workers.DEFERRED
+```
+
+### Deferred Responses
+
+Return `DEFERRED` to skip immediate response. The worker stays in the select loop, accepts new requests, and sends the response later via `request.respond()`:
+
+```python
+class MyWorker(_workers.Worker):
+    def setup(self):
+        self._jobs = {}
+
+    @_workers.api('/process', 'POST')
+    def process(self, request):
+        job_id = start_background_work(request.data)
+        self._jobs[job_id] = request
+        return _workers.DEFERRED
+
+    def on_work_done(self, job_id, result):
+        request = self._jobs.pop(job_id)
+        request.respond(data={'result': result})
+```
+
+Note: deferred requests are still subject to dispatcher timeout — call `self.keep_alive()` periodically to prevent 504.
+
+### Keep Alive
+
+Call `self.keep_alive()` during long operations to reset both the request timeout and stuck worker detection:
+
+```python
+@_workers.api('/export', 'POST')
+def export(self, request):
+    for chunk in generate_large_export():
+        self.keep_alive()
+    return {'status': 'done'}
 ```
 
 ## URL Patterns

@@ -5,7 +5,8 @@ import unittest
 import multiprocessing as mp
 
 from uhttp.workers import (
-    Worker, Request, Response, api, RejectRequest,
+    Worker, Request, Response, api, RejectRequest, DEFERRED,
+    Logger, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR,
     MSG_RESPONSE, MSG_HEARTBEAT)
 
 
@@ -321,6 +322,118 @@ class TestWorkerRunLoop(unittest.TestCase):
         control_queue.put(None)
         worker.join(timeout=5)
         self.assertFalse(worker.is_alive())
+
+
+class DeferredWorker(Worker):
+    @api('/defer', 'POST')
+    def defer(self, request):
+        return DEFERRED
+
+    @api('/normal', 'GET')
+    def normal(self, request):
+        return {'ok': True}
+
+
+class TestDeferredResponse(unittest.TestCase):
+
+    def setUp(self):
+        queues = [mp.Queue() for _ in range(3)]
+        self.worker = DeferredWorker(0, *queues)
+        self.worker._build_routes()
+
+    def test_deferred_returns_none(self):
+        req = Request(1, 'POST', '/defer')
+        resp = self.worker._handle_request(req)
+        self.assertIsNone(resp)
+
+    def test_normal_returns_response(self):
+        req = Request(2, 'GET', '/normal')
+        resp = self.worker._handle_request(req)
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.status, 200)
+
+    def test_request_respond(self):
+        response_queue = mp.Queue()
+        req = Request(1, 'POST', '/defer')
+        req._response_queue = response_queue
+        req.respond(data={'done': True}, status=201)
+        msg = response_queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_RESPONSE)
+        self.assertEqual(msg[1], 1)
+        self.assertEqual(msg[2].status, 201)
+        self.assertEqual(msg[2].data, {'done': True})
+
+    def test_deferred_run_loop(self):
+        """DEFERRED handler does not put response on queue."""
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        worker = DeferredWorker(
+            0, request_queue, control_queue, response_queue)
+        worker.heartbeat_interval = 0.1
+        request_queue.put(Request(1, 'POST', '/defer'))
+        worker.start()
+        # collect messages — should get heartbeat but no MSG_RESPONSE
+        deadline = time.time() + 2
+        messages = []
+        while time.time() < deadline:
+            try:
+                msg = response_queue.get(timeout=0.2)
+                messages.append(msg)
+            except Exception:
+                continue
+        control_queue.put(None)
+        worker.join(timeout=5)
+        response_msgs = [m for m in messages if m[0] == MSG_RESPONSE]
+        self.assertEqual(len(response_msgs), 0)
+        heartbeat_msgs = [m for m in messages if m[0] == MSG_HEARTBEAT]
+        self.assertGreater(len(heartbeat_msgs), 0)
+
+
+class TestKeepAlive(unittest.TestCase):
+
+    def test_keep_alive_sends_heartbeat(self):
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        worker = SimpleWorker(0, request_queue, control_queue, response_queue)
+        worker._current_request_id = 42
+        worker.keep_alive()
+        msg = response_queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_HEARTBEAT)
+        self.assertEqual(msg[2], 0)  # worker_id
+        self.assertEqual(msg[3], 42)  # request_id
+
+
+class TestLoggerLevelChecks(unittest.TestCase):
+
+    def test_debug_level(self):
+        log = Logger('test', mp.Queue(), level=LOG_DEBUG)
+        self.assertTrue(log.is_debug)
+        self.assertTrue(log.is_info)
+        self.assertTrue(log.is_warning)
+        self.assertTrue(log.is_error)
+
+    def test_info_level(self):
+        log = Logger('test', mp.Queue(), level=LOG_INFO)
+        self.assertFalse(log.is_debug)
+        self.assertTrue(log.is_info)
+        self.assertTrue(log.is_warning)
+        self.assertTrue(log.is_error)
+
+    def test_warning_level(self):
+        log = Logger('test', mp.Queue(), level=LOG_WARNING)
+        self.assertFalse(log.is_debug)
+        self.assertFalse(log.is_info)
+        self.assertTrue(log.is_warning)
+        self.assertTrue(log.is_error)
+
+    def test_error_level(self):
+        log = Logger('test', mp.Queue(), level=LOG_ERROR)
+        self.assertFalse(log.is_debug)
+        self.assertFalse(log.is_info)
+        self.assertFalse(log.is_warning)
+        self.assertTrue(log.is_error)
 
 
 if __name__ == '__main__':
