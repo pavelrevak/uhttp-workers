@@ -302,6 +302,62 @@ def export(self, request):
     return {'status': 'done'}
 ```
 
+### Server-Sent Events (SSE)
+
+Stream events to clients using the same API as `uhttp.server.Client`:
+
+```python
+class MyWorker(_workers.Worker):
+    def setup(self):
+        self._subscribers = {}
+
+    @_workers.api('/events', 'GET')
+    def events(self, request):
+        request.response_stream()  # sends headers, keeps connection open
+        self._subscribers[request.request_id] = request
+        return _workers.DEFERRED
+
+    def notify(self, data):
+        for req in self._subscribers.values():
+            req.send_event(data=data, event='update')
+
+    def on_disconnect(self, request_id):
+        self._subscribers.pop(request_id, None)
+```
+
+Available streaming methods on `Request`:
+
+| Method | Description |
+|--------|-------------|
+| `response_stream(content_type, headers, cookies)` | Start streaming (default: `text/event-stream`) |
+| `send_event(data, event, event_id, retry)` | Send SSE event |
+| `send_chunk(data)` | Send raw data chunk |
+| `response_stream_end()` | End stream and close connection |
+
+Streaming requests are excluded from dispatcher timeout expiration. When the client disconnects, the dispatcher notifies the worker via `on_disconnect(request_id)`.
+
+### Flow Control
+
+Workers can stop accepting new requests when busy. Requests stay in the shared pool queue for other workers to pick up:
+
+```python
+class MyWorker(_workers.Worker):
+    @_workers.api('/events', 'GET')
+    def subscribe(self, request):
+        request.response_stream()
+        self._subscribers[request.request_id] = request
+        if len(self._subscribers) >= 100:
+            self.pause()
+        return _workers.DEFERRED
+
+    def on_disconnect(self, request_id):
+        self._subscribers.pop(request_id, None)
+        if not self._accepting and len(self._subscribers) < 100:
+            self.resume()
+```
+
+`pause()` excludes the request queue from `select()` — the worker continues processing control messages, custom fd events, and `on_idle()`. `resume()` re-enables request acceptance.
+
 ## URL Patterns
 
 Dispatcher uses prefix matching to route requests to pools:

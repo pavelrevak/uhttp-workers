@@ -7,7 +7,9 @@ import multiprocessing as mp
 from uhttp.workers import (
     Worker, Request, Response, api, RejectRequest, DEFERRED,
     Logger, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR,
-    MSG_RESPONSE, MSG_HEARTBEAT)
+    MSG_RESPONSE, MSG_HEARTBEAT,
+    MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE,
+    CTL_DISCONNECT)
 
 
 class SimpleWorker(Worker):
@@ -434,6 +436,193 @@ class TestLoggerLevelChecks(unittest.TestCase):
         self.assertFalse(log.is_info)
         self.assertFalse(log.is_warning)
         self.assertTrue(log.is_error)
+
+
+class SSEWorker(Worker):
+    @api('/events', 'GET')
+    def events(self, request):
+        request.response_stream()
+        return DEFERRED
+
+
+class TestSSERequest(unittest.TestCase):
+    """Test SSE methods on Request — message format and queue delivery."""
+
+    def setUp(self):
+        self.queue = mp.Queue()
+        self.req = Request(10, 'GET', '/events')
+        self.req._response_queue = self.queue
+
+    def test_response_stream(self):
+        self.req.response_stream(
+            content_type='text/event-stream',
+            headers={'X-Custom': '1'},
+            cookies={'sid': 'abc'})
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_SSE_OPEN)
+        self.assertEqual(msg[1], 10)
+        self.assertEqual(msg[2], 'text/event-stream')
+        self.assertEqual(msg[3], {'X-Custom': '1'})
+        self.assertEqual(msg[4], {'sid': 'abc'})
+
+    def test_response_stream_defaults(self):
+        self.req.response_stream()
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_SSE_OPEN)
+        self.assertIsNone(msg[2])  # content_type
+        self.assertIsNone(msg[3])  # headers
+        self.assertIsNone(msg[4])  # cookies
+
+    def test_send_event(self):
+        self.req.send_event(
+            data={'count': 1}, event='update',
+            event_id='5', retry=3000)
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_SSE_EVENT)
+        self.assertEqual(msg[1], 10)
+        self.assertEqual(msg[2], {'count': 1})
+        self.assertEqual(msg[3], 'update')
+        self.assertEqual(msg[4], '5')
+        self.assertEqual(msg[5], 3000)
+
+    def test_send_event_data_only(self):
+        self.req.send_event(data='hello')
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[2], 'hello')
+        self.assertIsNone(msg[3])  # event
+        self.assertIsNone(msg[4])  # event_id
+        self.assertIsNone(msg[5])  # retry
+
+    def test_send_chunk(self):
+        self.req.send_chunk(b'raw data')
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_SSE_EVENT)
+        self.assertEqual(msg[2], b'raw data')
+        # send_chunk uses None for event/event_id/retry
+        self.assertIsNone(msg[3])
+        self.assertIsNone(msg[4])
+        self.assertIsNone(msg[5])
+
+    def test_response_stream_end(self):
+        self.req.response_stream_end()
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_SSE_CLOSE)
+        self.assertEqual(msg[1], 10)
+
+    def test_sse_handler_returns_deferred(self):
+        queues = [mp.Queue() for _ in range(3)]
+        worker = SSEWorker(0, *queues)
+        worker._build_routes()
+        req = Request(1, 'GET', '/events')
+        req._response_queue = queues[2]
+        resp = worker._handle_request(req)
+        self.assertIsNone(resp)
+        # response_stream() should have been sent
+        msg = queues[2].get(timeout=1)
+        self.assertEqual(msg[0], MSG_SSE_OPEN)
+
+
+class TrackingDisconnectWorker(Worker):
+    def on_disconnect(self, request_id):
+        # signal disconnect via response queue
+        self._response_queue.put(('DISCONNECTED', request_id))
+
+
+class TestSSEWorkerDisconnect(unittest.TestCase):
+    """Test on_disconnect via control queue."""
+
+    def test_disconnect_control_message(self):
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        control_queue.put((CTL_DISCONNECT, 42))
+        control_queue.put(None)  # stop
+        worker = TrackingDisconnectWorker(
+            0, request_queue, control_queue, response_queue)
+        worker.heartbeat_interval = 0.1
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        # find DISCONNECTED message in response queue
+        found = False
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            try:
+                msg = response_queue.get(timeout=0.2)
+            except Exception:
+                continue
+            if msg[0] == 'DISCONNECTED':
+                self.assertEqual(msg[1], 42)
+                found = True
+                break
+        self.assertTrue(found)
+
+
+class PausingWorker(Worker):
+    """Worker that pauses after first request."""
+
+    @api('/work', 'POST')
+    def work(self, request):
+        self.pause()
+        return {'paused': True}
+
+    @api('/resume', 'POST')
+    def do_resume(self, request):
+        self.resume()
+        return {'resumed': True}
+
+
+class TestWorkerPauseResume(unittest.TestCase):
+
+    def test_pause_resume_flags(self):
+        queues = [mp.Queue() for _ in range(3)]
+        worker = SimpleWorker(0, *queues)
+        self.assertTrue(worker._accepting)
+        worker.pause()
+        self.assertFalse(worker._accepting)
+        worker.resume()
+        self.assertTrue(worker._accepting)
+
+    def test_paused_worker_skips_request(self):
+        """Paused worker does not pick up requests from queue."""
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        worker = PausingWorker(
+            0, request_queue, control_queue, response_queue)
+        worker.heartbeat_interval = 0.2
+        # first request will pause the worker
+        request_queue.put(Request(1, 'POST', '/work'))
+        # second request should stay in queue (worker paused)
+        request_queue.put(Request(2, 'POST', '/work'))
+        worker.start()
+        # wait for first response
+        deadline = time.time() + 5
+        responses = []
+        while time.time() < deadline:
+            try:
+                msg = response_queue.get(timeout=0.3)
+            except Exception:
+                # after getting first response, give worker time
+                # to NOT pick up second request
+                if responses:
+                    break
+                continue
+            if msg[0] == MSG_RESPONSE:
+                responses.append(msg)
+                if len(responses) >= 1:
+                    # wait a bit to confirm no second response
+                    time.sleep(0.5)
+                    break
+        control_queue.put(None)
+        worker.join(timeout=5)
+        # only one response — second request stayed in queue
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][1], 1)  # request_id
+        # second request still in queue
+        self.assertFalse(request_queue.empty())
+        req = request_queue.get_nowait()
+        self.assertEqual(req.request_id, 2)
 
 
 if __name__ == '__main__':

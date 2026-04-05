@@ -20,10 +20,14 @@ import uhttp.server as _uhttp_server
 MSG_RESPONSE = 'RESPONSE'
 MSG_HEARTBEAT = 'HEARTBEAT'
 MSG_LOG = 'LOG'
+MSG_SSE_OPEN = 'SSE_OPEN'
+MSG_SSE_EVENT = 'SSE_EVENT'
+MSG_SSE_CLOSE = 'SSE_CLOSE'
 
 # Worker control messages
 CTL_STOP = 'STOP'
 CTL_CONFIG = 'CONFIG'
+CTL_DISCONNECT = 'DISCONNECT'
 
 # Sentinel for deferred response
 DEFERRED = object()
@@ -241,6 +245,39 @@ class Request:
             (MSG_RESPONSE, self.request_id,
              Response(self.request_id, data=data, status=status)))
 
+    def response_stream(self, content_type=None, headers=None, cookies=None):
+        """Start streaming response.
+
+        Use with DEFERRED — call from handler, then send_event()
+        or send_chunk() later. Call response_stream_end() when done.
+        """
+        self._response_queue.put(
+            (MSG_SSE_OPEN, self.request_id,
+             content_type, headers, cookies))
+
+    def send_chunk(self, data):
+        """Send raw data chunk to stream."""
+        self._response_queue.put(
+            (MSG_SSE_EVENT, self.request_id, data, None, None, None))
+
+    def send_event(self, data=None, event=None, event_id=None, retry=None):
+        """Send SSE event to stream.
+
+        Args:
+            data: Event data (str, dict, list, number).
+            event: Event type name.
+            event_id: Event ID for client reconnection.
+            retry: Reconnection time in milliseconds.
+        """
+        self._response_queue.put(
+            (MSG_SSE_EVENT, self.request_id,
+             data, event, event_id, retry))
+
+    def response_stream_end(self):
+        """End streaming response and close connection."""
+        self._response_queue.put(
+            (MSG_SSE_CLOSE, self.request_id))
+
 
 class Response:
     """HTTP response data passed from worker to dispatcher via queue.
@@ -393,6 +430,7 @@ class Worker(_mp.Process):
         self._writers = {}
         self._current_request_id = None
         self._running = True
+        self._accepting = True
 
     def _build_routes(self):
         """Collect @api decorated methods from worker and HANDLERS."""
@@ -469,6 +507,18 @@ class Worker(_mp.Process):
         Extra kwargs from WorkerPool are available as self.kwargs.
         """
 
+    def pause(self):
+        """Stop accepting new requests from queue.
+
+        Worker continues processing control messages, custom fd
+        events, and on_idle(). Call resume() to accept again.
+        """
+        self._accepting = False
+
+    def resume(self):
+        """Resume accepting requests from queue."""
+        self._accepting = True
+
     def keep_alive(self):
         """Signal dispatcher that worker is still processing.
 
@@ -483,6 +533,15 @@ class Worker(_mp.Process):
         """Called on each heartbeat interval when no request arrived.
 
         Override for periodic background processing.
+        """
+
+    def on_disconnect(self, request_id):
+        """Called when client disconnects from a deferred/streaming request.
+
+        Override to clean up resources associated with the request.
+
+        Args:
+            request_id: ID of the disconnected request.
         """
 
     def on_config(self, config):
@@ -507,6 +566,8 @@ class Worker(_mp.Process):
                 return
             if isinstance(msg, tuple) and msg[0] == CTL_CONFIG:
                 self.on_config(msg[1])
+            elif isinstance(msg, tuple) and msg[0] == CTL_DISCONNECT:
+                self.on_disconnect(msg[1])
 
     def do_check(self, request):
         """Validation hook called before routing request to handler.
@@ -596,7 +657,9 @@ class Worker(_mp.Process):
         req_reader = self._request_queue._reader
         ctl_reader = self._control_queue._reader
         while self._running:
-            read_fds = [req_reader, ctl_reader] + list(self._readers)
+            read_fds = [ctl_reader] + list(self._readers)
+            if self._accepting:
+                read_fds.append(req_reader)
             write_fds = list(self._writers)
             readable, writable, _ = _select.select(
                 read_fds, write_fds, [], self.heartbeat_interval)
@@ -852,12 +915,14 @@ class WorkerPool:
 # Pending request tracking
 
 class _PendingRequest:
-    __slots__ = ('client', 'timestamp', 'pool')
+    __slots__ = ('client', 'timestamp', 'pool', 'worker_id', 'streaming')
 
     def __init__(self, client, pool):
         self.client = client
         self.timestamp = _time.time()
         self.pool = pool
+        self.worker_id = None
+        self.streaming = False
 
 
 # Dispatcher
@@ -1076,9 +1141,35 @@ class Dispatcher:
                 pending = self._pending.get(request_id)
                 if pending is not None:
                     pending.timestamp = _time.time()
+                    pending.worker_id = worker_id
         elif msg_type == MSG_LOG:
             _, name, level, message = msg
             self.on_log(name, level, message)
+        elif msg_type == MSG_SSE_OPEN:
+            _, request_id, content_type, headers, cookies = msg
+            pending = self._pending.get(request_id)
+            if pending is not None:
+                pending.streaming = True
+                pending.client.response_stream(
+                    content_type=content_type,
+                    headers=headers, cookies=cookies)
+        elif msg_type == MSG_SSE_EVENT:
+            _, request_id, data, event, event_id, retry = msg
+            pending = self._pending.get(request_id)
+            if pending is not None:
+                if event is None and event_id is None and retry is None:
+                    ok = pending.client.send_chunk(data)
+                else:
+                    ok = pending.client.send_event(
+                        data=data, event=event,
+                        event_id=event_id, retry=retry)
+                if not ok:
+                    self._stream_disconnected(request_id, pending)
+        elif msg_type == MSG_SSE_CLOSE:
+            _, request_id = msg
+            pending = self._pending.pop(request_id, None)
+            if pending is not None:
+                pending.client.response_stream_end()
         elif msg_type == MSG_RESPONSE:
             _, request_id, response = msg
             pending = self._pending.pop(request_id, None)
@@ -1088,6 +1179,15 @@ class Dispatcher:
                     status=response.status,
                     headers=response.headers)
                 self.on_response(response, pending)
+
+    def _stream_disconnected(self, request_id, pending):
+        """Handle client disconnect during streaming."""
+        self._pending.pop(request_id, None)
+        if pending.worker_id is not None:
+            pool = pending.pool
+            if pending.worker_id < len(pool._control_queues):
+                pool._control_queues[pending.worker_id].put(
+                    (CTL_DISCONNECT, request_id))
 
     def _process_responses(self):
         """Process all pending messages from response queue."""
@@ -1104,7 +1204,8 @@ class Dispatcher:
         now = _time.time()
         expired = [
             rid for rid, pending in self._pending.items()
-            if now - pending.timestamp > pending.pool.timeout]
+            if not pending.streaming
+            and now - pending.timestamp > pending.pool.timeout]
         for request_id in expired:
             pending = self._pending.pop(request_id)
             self.on_log(

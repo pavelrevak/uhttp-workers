@@ -10,6 +10,8 @@ from uhttp.workers import (
     Dispatcher, Worker, WorkerPool, Request, Response,
     api, sync, RejectRequest,
     MSG_RESPONSE, MSG_HEARTBEAT,
+    MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE,
+    CTL_DISCONNECT,
     _PendingRequest,
 )
 
@@ -51,6 +53,30 @@ class MockClient:
     def respond_file(self, path, headers=None):
         self.responded = True
         self.file_path = path
+
+    def response_stream(self, content_type=None, headers=None, cookies=None):
+        self.streaming = True
+        self.stream_content_type = content_type
+        self.stream_headers = headers
+        self.stream_cookies = cookies
+        return True
+
+    def send_event(self, data=None, event=None, event_id=None, retry=None):
+        if not hasattr(self, '_events'):
+            self._events = []
+        self._events.append({
+            'data': data, 'event': event,
+            'event_id': event_id, 'retry': retry})
+        return getattr(self, '_connected', True)
+
+    def send_chunk(self, data):
+        if not hasattr(self, '_chunks'):
+            self._chunks = []
+        self._chunks.append(data)
+        return getattr(self, '_connected', True)
+
+    def response_stream_end(self):
+        self.stream_ended = True
 
 
 class TestDispatcherSyncRoutes(unittest.TestCase):
@@ -411,6 +437,119 @@ class TestDispatcherRoutePriority(unittest.TestCase):
         self.assertEqual(client.response_data, {'sync': True})
         # should NOT be in pending (not dispatched to pool)
         self.assertEqual(len(d._pending), 0)
+
+
+class TestDispatcherSSE(unittest.TestCase):
+
+    def _make_dispatcher(self):
+        pool = WorkerPool(DummyWorker, routes=['/api/**'])
+        d = Dispatcher.__new__(Dispatcher)
+        d._sync_routes = []
+        d._static_routes = {}
+        d._pools = [pool]
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+        d._response_queue = mp.Queue()
+        d._log_is_tty = False
+        d.on_log = lambda *_: None
+        return d, pool
+
+    def test_sse_open(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/events')
+        pending = _PendingRequest(client, pool)
+        pending.worker_id = 0
+        d._pending[1] = pending
+        d._process_response(
+            (MSG_SSE_OPEN, 1, 'text/event-stream', None, None))
+        self.assertTrue(client.streaming)
+        self.assertEqual(client.stream_content_type, 'text/event-stream')
+        self.assertTrue(pending.streaming)
+        # still in pending
+        self.assertIn(1, d._pending)
+
+    def test_sse_send_event(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/events')
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        d._pending[1] = pending
+        d._process_response(
+            (MSG_SSE_EVENT, 1, {'count': 5}, 'update', '3', None))
+        self.assertEqual(len(client._events), 1)
+        self.assertEqual(client._events[0]['data'], {'count': 5})
+        self.assertEqual(client._events[0]['event'], 'update')
+        self.assertEqual(client._events[0]['event_id'], '3')
+
+    def test_sse_send_chunk(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/stream')
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        d._pending[1] = pending
+        # send_chunk: event/event_id/retry are all None
+        d._process_response(
+            (MSG_SSE_EVENT, 1, b'raw data', None, None, None))
+        self.assertEqual(len(client._chunks), 1)
+        self.assertEqual(client._chunks[0], b'raw data')
+
+    def test_sse_close(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/events')
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        d._pending[1] = pending
+        d._process_response((MSG_SSE_CLOSE, 1))
+        self.assertTrue(client.stream_ended)
+        # removed from pending
+        self.assertNotIn(1, d._pending)
+
+    def test_sse_client_disconnect(self):
+        d, pool = self._make_dispatcher()
+        pool.start(d._response_queue)
+        client = MockClient('GET', '/api/events')
+        client._connected = False  # simulate disconnected client
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        pending.worker_id = 0
+        d._pending[1] = pending
+        d._process_response(
+            (MSG_SSE_EVENT, 1, {'data': 'test'}, 'ping', None, None))
+        # removed from pending
+        self.assertNotIn(1, d._pending)
+        # CTL_DISCONNECT sent to worker's control queue
+        msg = pool._control_queues[0].get(timeout=1)
+        self.assertEqual(msg, (CTL_DISCONNECT, 1))
+        pool.shutdown(timeout=2)
+
+    def test_streaming_excluded_from_timeout(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/events')
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        pending.timestamp = 0  # very old
+        d._pending[1] = pending
+        d._expire_pending()
+        # streaming request should NOT be expired
+        self.assertIn(1, d._pending)
+
+    def test_non_streaming_expires(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/test')
+        pending = _PendingRequest(client, pool)
+        pending.timestamp = 0  # very old
+        d._pending[1] = pending
+        d._expire_pending()
+        # non-streaming should be expired
+        self.assertNotIn(1, d._pending)
+
+    def test_sse_event_ignored_after_close(self):
+        d, pool = self._make_dispatcher()
+        # no pending request with id 99
+        d._process_response(
+            (MSG_SSE_EVENT, 99, {'data': 'test'}, None, None, None))
+        # should not raise, just ignore
 
 
 if __name__ == '__main__':
