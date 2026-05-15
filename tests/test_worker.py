@@ -124,6 +124,14 @@ class RejectWorker(Worker):
         return {'data': 'ok'}
 
 
+class RejectFromHandlerWorker(Worker):
+    """Worker where handler raises RejectRequest."""
+
+    @api('/protected', 'GET')
+    def protected(self, request):
+        raise RejectRequest(data={'error': 'no access'}, status=403)
+
+
 class FailCheckWorker(Worker):
     """Worker with do_check that raises unexpected exception."""
 
@@ -162,6 +170,15 @@ class TestWorkerDoCheck(unittest.TestCase):
         req = Request(1, 'GET', '/data')
         resp = worker._handle_request(req)
         self.assertEqual(resp.status, 403)
+
+    def test_reject_from_handler(self):
+        queues = [mp.Queue() for _ in range(3)]
+        worker = RejectFromHandlerWorker(0, *queues)
+        worker._build_routes()
+        req = Request(1, 'GET', '/protected')
+        resp = worker._handle_request(req)
+        self.assertEqual(resp.status, 403)
+        self.assertEqual(resp.data, {'error': 'no access'})
 
     def test_do_check_exception(self):
         queues = [mp.Queue() for _ in range(3)]
@@ -553,6 +570,101 @@ class TestSSEWorkerDisconnect(unittest.TestCase):
                 continue
             if msg[0] == 'DISCONNECTED':
                 self.assertEqual(msg[1], 42)
+                found = True
+                break
+        self.assertTrue(found)
+
+
+class HeadersCookiesWorker(Worker):
+    """Worker that returns headers/cookies in various ways."""
+
+    @api('/three-tuple', 'GET')
+    def three_tuple(self, request):
+        return {'ok': True}, 201, {'X-Custom': 'val'}
+
+    @api('/response-obj', 'GET')
+    def response_obj(self, request):
+        return Response(
+            None, data={'ok': True}, status=200,
+            headers={'X-Custom': 'val'},
+            cookies={'session': 'abc'})
+
+    @api('/two-tuple', 'GET')
+    def two_tuple(self, request):
+        return {'ok': True}, 202
+
+
+class TestResponseHeadersCookies(unittest.TestCase):
+
+    def setUp(self):
+        queues = [mp.Queue() for _ in range(3)]
+        self.worker = HeadersCookiesWorker(0, *queues)
+        self.worker._build_routes()
+
+    def test_three_tuple(self):
+        req = Request(1, 'GET', '/three-tuple')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 201)
+        self.assertEqual(resp.data, {'ok': True})
+        self.assertEqual(resp.headers, {'X-Custom': 'val'})
+        self.assertIsNone(resp.cookies)
+
+    def test_response_object(self):
+        req = Request(7, 'GET', '/response-obj')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.request_id, 7)  # auto-set
+        self.assertEqual(resp.headers, {'X-Custom': 'val'})
+        self.assertEqual(resp.cookies, {'session': 'abc'})
+
+    def test_two_tuple_no_headers(self):
+        req = Request(1, 'GET', '/two-tuple')
+        resp = self.worker._handle_request(req)
+        self.assertEqual(resp.status, 202)
+        self.assertIsNone(resp.headers)
+        self.assertIsNone(resp.cookies)
+
+    def test_request_respond_with_cookies(self):
+        queue = mp.Queue()
+        req = Request(5, 'GET', '/x')
+        req._response_queue = queue
+        req.respond(
+            data={'ok': True},
+            headers={'X-H': '1'},
+            cookies={'sid': 'xyz'})
+        msg = queue.get(timeout=1)
+        self.assertEqual(msg[2].headers, {'X-H': '1'})
+        self.assertEqual(msg[2].cookies, {'sid': 'xyz'})
+
+
+class TeardownWorker(Worker):
+    """Worker that signals teardown via response queue."""
+
+    def teardown(self):
+        self._response_queue.put(('TEARDOWN', self.worker_id, None))
+
+
+class TestWorkerTeardown(unittest.TestCase):
+
+    def test_teardown_called_on_stop(self):
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        control_queue.put(None)  # immediate stop
+        worker = TeardownWorker(
+            0, request_queue, control_queue, response_queue)
+        worker.heartbeat_interval = 0.1
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        # find TEARDOWN message
+        found = False
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            try:
+                msg = response_queue.get(timeout=0.2)
+            except Exception:
+                break
+            if msg[0] == 'TEARDOWN':
                 found = True
                 break
         self.assertTrue(found)

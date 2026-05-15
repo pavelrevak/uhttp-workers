@@ -220,6 +220,21 @@ class MyWorker(_workers.Worker):
 
 Extra keyword arguments from `WorkerPool(...)` are available as `self.kwargs`.
 
+### Teardown
+
+`teardown()` is called once when the worker process is stopping — use it to release resources:
+
+```python
+class MyWorker(_workers.Worker):
+    def setup(self):
+        self.db = connect_db()
+
+    def teardown(self):
+        self.db.close()
+```
+
+Called after the run loop exits (clean stop, orphan detection, or pipe close), before the process terminates. Exceptions are logged but do not block shutdown.
+
 ### Configuration Updates
 
 Dispatcher can send configuration to workers at runtime via per-worker control queues:
@@ -264,8 +279,27 @@ def process(self, request):
     # return data with status
     return {'error': 'not found'}, 404
 
+    # return data with status and headers
+    return {'ok': True}, 200, {'X-Custom': 'value'}
+
+    # return Response object — full control (headers, cookies)
+    return _workers.Response(
+        None,  # request_id is set automatically
+        data={'ok': True},
+        headers={'X-Custom': 'value'},
+        cookies={'session': 'abc123'})
+
     # defer response — worker continues accepting requests
     return _workers.DEFERRED
+```
+
+`request.respond()` (for deferred responses) also accepts `headers` and `cookies`:
+
+```python
+request.respond(
+    data={'result': 'done'},
+    headers={'X-Job-Id': '42'},
+    cookies={'session': 'abc'})
 ```
 
 ### Deferred Responses
@@ -418,6 +452,17 @@ Return `(data, status)` tuple to reject, or `None` to continue. You can also rai
 
 `RejectRequest` accepts optional `data` (default: `{'error': 'Rejected'}`) and `status` (default: `403`).
 
+`RejectRequest` can also be raised from request handlers — useful for access control within individual endpoints:
+
+```python
+    @_workers.api('/admin/users', 'GET')
+    def admin_users(self, request):
+        if not self.is_admin(request):
+            raise _workers.RejectRequest(
+                data={'error': 'admin only'}, status=403)
+        return {'users': self.list_users()}
+```
+
 ### Error Handling
 
 Override `on_request_error()` on the worker to customize error handling when a request handler raises an exception:
@@ -508,6 +553,20 @@ class MyWorker(_workers.Worker):
 ```
 
 Log messages are sent to the dispatcher via the shared response queue and printed in the dispatcher process — no interleaved output from multiple processes.
+
+The dispatcher itself also has a `self.log` Logger that writes directly via `on_log()` (no queue), so it can be used at any time — including before workers are started:
+
+```python
+class MyDispatcher(_workers.Dispatcher):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.log.info("Dispatcher starting on port %d", self._port)
+
+    def on_idle(self):
+        self.log.debug("idle tick")
+```
+
+Set dispatcher log level via constructor: `Dispatcher(log_level=LOG_DEBUG, ...)` (default `LOG_INFO`).
 
 **Log levels:** `LOG_DEBUG` (10), `LOG_INFO` (20), `LOG_WARNING` (30), `LOG_ERROR` (40), `LOG_CRITICAL` (50)
 

@@ -236,14 +236,16 @@ class Request:
                 _uhttp_server.parse_cookies(raw) if raw else {})
         return self._cookies
 
-    def respond(self, data=None, status=200):
+    def respond(self, data=None, status=200, headers=None, cookies=None):
         """Send deferred response for this request.
 
         Use after returning DEFERRED from handler.
         """
         self._response_queue.put(
             (MSG_RESPONSE, self.request_id,
-             Response(self.request_id, data=data, status=status)))
+             Response(
+                 self.request_id, data=data, status=status,
+                 headers=headers, cookies=cookies)))
 
     def response_stream(self, content_type=None, headers=None, cookies=None):
         """Start streaming response.
@@ -287,16 +289,19 @@ class Response:
         status: HTTP status code.
         data: Response body — dict (JSON), bytes (binary), or None.
         headers: Response headers dict, or None.
+        cookies: Response cookies dict, or None.
     """
 
-    __slots__ = ('request_id', 'status', 'data', 'headers')
+    __slots__ = ('request_id', 'status', 'data', 'headers', 'cookies')
 
     def __init__(
-            self, request_id, data=None, status=200, headers=None):
+            self, request_id, data=None, status=200,
+            headers=None, cookies=None):
         self.request_id = request_id
         self.status = status
         self.data = data
         self.headers = headers
+        self.cookies = cookies
 
 
 # API Handler
@@ -331,10 +336,20 @@ class Logger:
         level: Minimum log level.
     """
 
-    def __init__(self, name, queue, level=LOG_WARNING):
+    def __init__(self, name, queue=None, level=LOG_WARNING, sink=None):
+        """Logger that sends to dispatcher via queue or direct callable.
+
+        Args:
+            name: Logger name.
+            queue: multiprocessing.Queue (worker context).
+            level: Minimum log level.
+            sink: Callable(name, level, message) — used instead of queue
+                (e.g., dispatcher's on_log).
+        """
         self.name = name
         self.level = level
         self._queue = queue
+        self._sink = sink
 
     @property
     def is_debug(self):
@@ -359,7 +374,10 @@ class Logger:
                 message = message.format(**kwargs) if kwargs else message
             except (TypeError, KeyError, IndexError, ValueError):
                 message = f"{msg} {args} {kwargs}"
-            self._queue.put((MSG_LOG, self.name, level, message))
+            if self._sink is not None:
+                self._sink(self.name, level, message)
+            else:
+                self._queue.put((MSG_LOG, self.name, level, message))
 
     def critical(self, msg, *args, **kwargs):
         self._log(LOG_CRITICAL, msg, *args, **kwargs)
@@ -507,6 +525,14 @@ class Worker(_mp.Process):
         Extra kwargs from WorkerPool are available as self.kwargs.
         """
 
+    def teardown(self):
+        """Called once when worker process is stopping.
+
+        Override to clean up resources (close DB connections, flush buffers).
+        Called after the run loop exits, before the process terminates.
+        Exceptions are logged but do not prevent shutdown.
+        """
+
     def pause(self):
         """Stop accepting new requests from queue.
 
@@ -618,11 +644,25 @@ class Worker(_mp.Process):
             result = handler(request)
             if result is DEFERRED:
                 return None
+            if isinstance(result, Response):
+                result.request_id = request.request_id
+                return result
+            headers = None
             if isinstance(result, tuple):
-                data, status = result
+                if len(result) == 3:
+                    data, status, headers = result
+                else:
+                    data, status = result
             else:
                 data, status = result, 200
-            return Response(request.request_id, data=data, status=status)
+            return Response(
+                request.request_id, data=data,
+                status=status, headers=headers)
+        except RejectRequest as err:
+            return Response(
+                request.request_id,
+                data=err.data,
+                status=err.status)
         except Exception as err:
             return self.on_request_error(request, err)
 
@@ -656,6 +696,16 @@ class Worker(_mp.Process):
             return
         req_reader = self._request_queue._reader
         ctl_reader = self._control_queue._reader
+        try:
+            self._run_loop(req_reader, ctl_reader)
+        finally:
+            try:
+                self.teardown()
+            except Exception:
+                self.log.error(
+                    "teardown() failed:\n%s", _traceback.format_exc())
+
+    def _run_loop(self, req_reader, ctl_reader):
         while self._running:
             read_fds = [ctl_reader] + list(self._readers)
             if self._accepting:
@@ -941,7 +991,7 @@ class Dispatcher:
     def __init__(
             self, port=8080, address='0.0.0.0', pools=None,
             static_routes=None, shutdown_timeout=10,
-            max_pending=1000, **kwargs):
+            max_pending=1000, log_level=LOG_INFO, **kwargs):
         """Initialize dispatcher.
 
         Args:
@@ -974,6 +1024,10 @@ class Dispatcher:
         self._writers = {}
         self._log_is_tty = _sys.stderr.isatty()
         self._running = False
+        self.log = Logger(
+            type(self).__name__,
+            sink=self.on_log,
+            level=log_level)
         self._build_sync_routes()
 
     def _build_sync_routes(self):
@@ -1177,7 +1231,8 @@ class Dispatcher:
                 pending.client.respond(
                     response.data,
                     status=response.status,
-                    headers=response.headers)
+                    headers=response.headers,
+                    cookies=response.cookies)
                 self.on_response(response, pending)
 
     def _stream_disconnected(self, request_id, pending):
