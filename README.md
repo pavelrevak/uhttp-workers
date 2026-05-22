@@ -370,6 +370,31 @@ Available streaming methods on `Request`:
 
 Streaming requests are excluded from dispatcher timeout expiration. When the client disconnects, the dispatcher notifies the worker via `on_disconnect(request_id)`.
 
+### NDJSON Streaming
+
+Stream JSON objects line-by-line (`application/x-ndjson`) — one JSON value per line, terminated by `\n`. Useful for incremental APIs that aren't event-shaped (long lists, log tails, progress updates):
+
+```python
+class MyWorker(_workers.Worker):
+    @_workers.api('/devices/scan', 'GET')
+    def scan(self, request):
+        request.response_ndjson()
+        for device in self.discover_devices():
+            request.send_ndjson({'id': device.id, 'name': device.name})
+        request.response_stream_end()
+        return _workers.DEFERRED
+```
+
+NDJSON methods on `Request`:
+
+| Method | Description |
+|--------|-------------|
+| `response_ndjson(headers, cookies)` | Start NDJSON stream (wrapper over `response_stream` with `application/x-ndjson`) |
+| `send_ndjson(obj)` | Send one JSON-serializable value as a line |
+| `response_stream_end()` | End stream and close connection (shared with SSE) |
+
+Same lifecycle as SSE: excluded from timeout expiration, client disconnect triggers `on_disconnect(request_id)`.
+
 ### Flow Control
 
 Workers can stop accepting new requests when busy. Requests stay in the shared pool queue for other workers to pick up:

@@ -8,7 +8,7 @@ from uhttp.workers import (
     Worker, Request, Response, api, RejectRequest, DEFERRED,
     Logger, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR,
     MSG_RESPONSE, MSG_HEARTBEAT,
-    MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE,
+    MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE, MSG_NDJSON,
     CTL_DISCONNECT)
 
 
@@ -519,6 +519,38 @@ class TestSSERequest(unittest.TestCase):
         self.assertIsNone(msg[3])
         self.assertIsNone(msg[4])
         self.assertIsNone(msg[5])
+
+    def test_response_ndjson(self):
+        self.req.response_ndjson(
+            headers={'X-Custom': '1'},
+            cookies={'sid': 'abc'})
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_SSE_OPEN)
+        self.assertEqual(msg[1], 10)
+        self.assertEqual(msg[2], 'application/x-ndjson')
+        self.assertEqual(msg[3], {'X-Custom': '1'})
+        self.assertEqual(msg[4], {'sid': 'abc'})
+
+    def test_response_ndjson_defaults(self):
+        self.req.response_ndjson()
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_SSE_OPEN)
+        self.assertEqual(msg[2], 'application/x-ndjson')
+        self.assertIsNone(msg[3])
+        self.assertIsNone(msg[4])
+
+    def test_send_ndjson(self):
+        self.req.send_ndjson({'devices': [1, 2, 3]})
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_NDJSON)
+        self.assertEqual(msg[1], 10)
+        self.assertEqual(msg[2], {'devices': [1, 2, 3]})
+
+    def test_send_ndjson_keepalive(self):
+        self.req.send_ndjson({})
+        msg = self.queue.get(timeout=1)
+        self.assertEqual(msg[0], MSG_NDJSON)
+        self.assertEqual(msg[2], {})
 
     def test_response_stream_end(self):
         self.req.response_stream_end()

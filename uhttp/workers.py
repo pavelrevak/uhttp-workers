@@ -23,6 +23,7 @@ MSG_LOG = 'LOG'
 MSG_SSE_OPEN = 'SSE_OPEN'
 MSG_SSE_EVENT = 'SSE_EVENT'
 MSG_SSE_CLOSE = 'SSE_CLOSE'
+MSG_NDJSON = 'NDJSON'
 
 # Worker control messages
 CTL_STOP = 'STOP'
@@ -281,6 +282,25 @@ class Request:
         self._response_queue.put(
             (MSG_SSE_EVENT, self.request_id,
              data, event, event_id, retry))
+
+    def response_ndjson(self, headers=None, cookies=None):
+        """Start NDJSON streaming response (application/x-ndjson).
+
+        Thin wrapper over response_stream(). Use with DEFERRED — call from
+        handler, then send_ndjson() later. Call response_stream_end() to finish.
+        """
+        self._response_queue.put(
+            (MSG_SSE_OPEN, self.request_id,
+             'application/x-ndjson', headers, cookies))
+
+    def send_ndjson(self, obj):
+        """Send one JSON-serializable object as an NDJSON line.
+
+        Args:
+            obj: any JSON-serializable value (dict/list/str/int/float/bool/None)
+        """
+        self._response_queue.put(
+            (MSG_NDJSON, self.request_id, obj))
 
     def response_stream_end(self):
         """End streaming response and close connection."""
@@ -1251,6 +1271,13 @@ class Dispatcher:
                     ok = pending.client.send_event(
                         data=data, event=event,
                         event_id=event_id, retry=retry)
+                if not ok:
+                    self._stream_disconnected(request_id, pending)
+        elif msg_type == MSG_NDJSON:
+            _, request_id, obj = msg
+            pending = self._pending.get(request_id)
+            if pending is not None:
+                ok = pending.client.send_ndjson(obj)
                 if not ok:
                     self._stream_disconnected(request_id, pending)
         elif msg_type == MSG_SSE_CLOSE:

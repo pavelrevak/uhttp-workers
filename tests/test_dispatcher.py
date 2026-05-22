@@ -10,7 +10,7 @@ from uhttp.workers import (
     Dispatcher, Worker, WorkerPool, Request, Response,
     api, sync, RejectRequest,
     MSG_RESPONSE, MSG_HEARTBEAT,
-    MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE,
+    MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE, MSG_NDJSON,
     CTL_DISCONNECT,
     PENDING_COMPLETED, PENDING_TIMEOUT, PENDING_DISCONNECTED,
     PENDING_STREAM_CLOSED, PENDING_SHUTDOWN,
@@ -76,6 +76,12 @@ class MockClient:
         if not hasattr(self, '_chunks'):
             self._chunks = []
         self._chunks.append(data)
+        return getattr(self, '_connected', True)
+
+    def send_ndjson(self, obj):
+        if not hasattr(self, '_ndjson'):
+            self._ndjson = []
+        self._ndjson.append(obj)
         return getattr(self, '_connected', True)
 
     def response_stream_end(self):
@@ -546,6 +552,42 @@ class TestDispatcherSSE(unittest.TestCase):
         d._expire_pending()
         # non-streaming should be expired
         self.assertNotIn(1, d._pending)
+
+    def test_ndjson_send(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/stream')
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        d._pending[1] = pending
+        d._process_response(
+            (MSG_NDJSON, 1, {'devices': [1, 2, 3]}))
+        self.assertEqual(len(client._ndjson), 1)
+        self.assertEqual(client._ndjson[0], {'devices': [1, 2, 3]})
+        # still pending — stream open
+        self.assertIn(1, d._pending)
+
+    def test_ndjson_client_disconnect(self):
+        d, pool = self._make_dispatcher()
+        pool.start(d._response_queue)
+        client = MockClient('GET', '/api/stream')
+        client._connected = False
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        pending.worker_id = 0
+        d._pending[1] = pending
+        d._process_response((MSG_NDJSON, 1, {'x': 1}))
+        # removed from pending
+        self.assertNotIn(1, d._pending)
+        # CTL_DISCONNECT sent to worker's control queue
+        msg = pool._control_queues[0].get(timeout=1)
+        self.assertEqual(msg, (CTL_DISCONNECT, 1))
+        pool.shutdown(timeout=2)
+
+    def test_ndjson_ignored_after_close(self):
+        d, pool = self._make_dispatcher()
+        # no pending request with id 99
+        d._process_response((MSG_NDJSON, 99, {'x': 1}))
+        # should not raise, just ignore
 
     def test_sse_event_ignored_after_close(self):
         d, pool = self._make_dispatcher()
