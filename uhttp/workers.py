@@ -29,6 +29,13 @@ CTL_STOP = 'STOP'
 CTL_CONFIG = 'CONFIG'
 CTL_DISCONNECT = 'DISCONNECT'
 
+# Reasons for on_pending_removed
+PENDING_COMPLETED = 'COMPLETED'
+PENDING_TIMEOUT = 'TIMEOUT'
+PENDING_DISCONNECTED = 'DISCONNECTED'
+PENDING_STREAM_CLOSED = 'STREAM_CLOSED'
+PENDING_SHUTDOWN = 'SHUTDOWN'
+
 # Sentinel for deferred response
 DEFERRED = object()
 
@@ -1074,10 +1081,37 @@ class Dispatcher:
         """Called after response is sent to client.
 
         Override to post-process, e.g., forward data to another pool.
+        Fires only on a real handler response (PENDING_COMPLETED path);
+        use on_pending_removed() for lifecycle cleanup that must run
+        regardless of outcome.
 
         Args:
             response: Response object from worker.
             pending: _PendingRequest with client and pool reference.
+        """
+
+    def on_pending_removed(self, request_id, pending, reason):
+        """Called exactly once per dispatched request, whatever the outcome.
+
+        Override for side-state cleanup keyed by request_id. Fires after
+        the client-facing action (respond/disconnect/control queue put) so
+        the dispatcher state is already finalized when this runs.
+        Exceptions raised here are logged and swallowed.
+
+        Reason values:
+            PENDING_COMPLETED     - handler returned a response, client got it.
+                                    on_response() is invoked first.
+            PENDING_TIMEOUT       - request exceeded pool.timeout; client got 504.
+                                    Worker may still be processing the request.
+            PENDING_DISCONNECTED  - client disconnected mid-stream; worker was
+                                    notified via control queue (race possible).
+            PENDING_STREAM_CLOSED - worker ended the SSE stream cleanly.
+            PENDING_SHUTDOWN      - dispatcher is shutting down; client got 503.
+
+        Args:
+            request_id: The request id being removed.
+            pending: _PendingRequest snapshot (client, pool, worker_id, ...).
+            reason: One of the PENDING_* constants above.
         """
 
     def on_idle(self):
@@ -1224,6 +1258,8 @@ class Dispatcher:
             pending = self._pending.pop(request_id, None)
             if pending is not None:
                 pending.client.response_stream_end()
+                self._notify_pending_removed(
+                    request_id, pending, PENDING_STREAM_CLOSED)
         elif msg_type == MSG_RESPONSE:
             _, request_id, response = msg
             pending = self._pending.pop(request_id, None)
@@ -1234,6 +1270,8 @@ class Dispatcher:
                     headers=response.headers,
                     cookies=response.cookies)
                 self.on_response(response, pending)
+                self._notify_pending_removed(
+                    request_id, pending, PENDING_COMPLETED)
 
     def _stream_disconnected(self, request_id, pending):
         """Handle client disconnect during streaming."""
@@ -1243,6 +1281,18 @@ class Dispatcher:
             if pending.worker_id < len(pool._control_queues):
                 pool._control_queues[pending.worker_id].put(
                     (CTL_DISCONNECT, request_id))
+        self._notify_pending_removed(
+            request_id, pending, PENDING_DISCONNECTED)
+
+    def _notify_pending_removed(self, request_id, pending, reason):
+        """Invoke on_pending_removed, log and swallow exceptions."""
+        try:
+            self.on_pending_removed(request_id, pending, reason)
+        except Exception as exc:
+            self.on_log(
+                pending.pool.name, LOG_ERROR,
+                f"on_pending_removed({reason}) raised for "
+                f"request {request_id}: {exc!r}")
 
     def _process_responses(self):
         """Process all pending messages from response queue."""
@@ -1269,6 +1319,8 @@ class Dispatcher:
                 f"{pending.pool.timeout}s")
             pending.client.respond(
                 {'error': 'Request timeout'}, status=504)
+            self._notify_pending_removed(
+                request_id, pending, PENDING_TIMEOUT)
 
     def _check_all_workers(self):
         """Check health of all worker pools and queue sizes."""
@@ -1395,12 +1447,14 @@ class Dispatcher:
             except _queue.Empty:
                 pass
         # respond 503 to remaining pending
-        for pending in self._pending.values():
+        for request_id, pending in self._pending.items():
             try:
                 pending.client.respond(
                     {'error': 'Server shutting down'}, status=503)
             except Exception:
                 pass
+            self._notify_pending_removed(
+                request_id, pending, PENDING_SHUTDOWN)
         self._pending.clear()
         # shutdown all pools
         for pool in self._pools:

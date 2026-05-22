@@ -499,6 +499,43 @@ class MyDispatcher(_workers.Dispatcher):
 `pending` is a `_PendingRequest` with `client` (original connection) and `pool` (source pool).
 Requests with `request_id=-1` are ignored by the dispatcher when the worker responds.
 
+`on_response()` fires only for the happy path (handler returned a response). For lifecycle
+cleanup that must run regardless of outcome — timeouts, client disconnects, shutdown — use
+`on_pending_removed()` (see below).
+
+## Request Lifecycle Hook
+
+Override `on_pending_removed(request_id, pending, reason)` on the dispatcher when you keep
+side-state keyed by `request_id` and need it cleaned up exactly once, no matter how the
+request ended:
+
+```python
+class MyDispatcher(_workers.Dispatcher):
+    def on_pending_removed(self, request_id, pending, reason):
+        self._side_state.pop(request_id, None)
+        if reason == _workers.PENDING_TIMEOUT:
+            self._metrics.timeouts += 1
+```
+
+Reason is one of:
+
+| Constant | When |
+|---|---|
+| `PENDING_COMPLETED` | Handler returned a response, client got it. `on_response()` runs first. |
+| `PENDING_TIMEOUT` | Request exceeded `pool.timeout`; client got 504. Worker may still be processing. |
+| `PENDING_DISCONNECTED` | Client disconnected mid-stream; worker was notified via control queue (race possible). |
+| `PENDING_STREAM_CLOSED` | Worker ended the SSE stream cleanly. |
+| `PENDING_SHUTDOWN` | Dispatcher is shutting down; client got 503. |
+
+The hook is invoked after the client-facing action (respond / disconnect / control queue put)
+so dispatcher state is finalized when it runs. Exceptions raised by the hook are logged at
+`LOG_ERROR` and swallowed — they will not crash the dispatcher loop.
+
+Override `on_response()` if you only care about the happy path (e.g. cross-pool forwarding).
+Override `on_pending_removed()` if you need exactly-once cleanup. Overriding both is allowed
+but discouraged — for the `PENDING_COMPLETED` reason, `on_response()` is called immediately
+before `on_pending_removed()`.
+
 ## Dispatcher Idle Hook
 
 Override `on_idle()` on the dispatcher for periodic background tasks — called on each `select()` timeout (every `SELECT_TIMEOUT` seconds, default 1s):

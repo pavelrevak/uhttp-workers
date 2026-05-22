@@ -12,6 +12,9 @@ from uhttp.workers import (
     MSG_RESPONSE, MSG_HEARTBEAT,
     MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE,
     CTL_DISCONNECT,
+    PENDING_COMPLETED, PENDING_TIMEOUT, PENDING_DISCONNECTED,
+    PENDING_STREAM_CLOSED, PENDING_SHUTDOWN,
+    LOG_ERROR,
     _PendingRequest,
 )
 
@@ -550,6 +553,178 @@ class TestDispatcherSSE(unittest.TestCase):
         d._process_response(
             (MSG_SSE_EVENT, 99, {'data': 'test'}, None, None, None))
         # should not raise, just ignore
+
+
+class TestDispatcherPendingRemoved(unittest.TestCase):
+    """Tests for the on_pending_removed lifecycle hook."""
+
+    def _make_dispatcher(self, dispatcher_cls=Dispatcher):
+        pool = WorkerPool(DummyWorker, routes=['/api/**'])
+        d = dispatcher_cls.__new__(dispatcher_cls)
+        d._sync_routes = []
+        d._static_routes = {}
+        d._pools = [pool]
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+        d._response_queue = mp.Queue()
+        d._log_is_tty = False
+        d.log_calls = []
+        d.on_log = lambda name, level, msg: d.log_calls.append(
+            (name, level, msg))
+        d.recorded = []
+        return d, pool
+
+    def test_completed_fires_hook(self):
+
+        class RecordingDispatcher(Dispatcher):
+            def on_pending_removed(self, request_id, pending, reason):
+                self.recorded.append((request_id, reason))
+
+        d, pool = self._make_dispatcher(RecordingDispatcher)
+        client = MockClient('GET', '/api/test')
+        pending = _PendingRequest(client, pool)
+        d._pending[1] = pending
+        response = Response(request_id=1, data={'ok': True}, status=200)
+        d._process_response((MSG_RESPONSE, 1, response))
+        self.assertEqual(d.recorded, [(1, PENDING_COMPLETED)])
+
+    def test_completed_calls_on_response_before_hook(self):
+
+        class RecordingDispatcher(Dispatcher):
+            def on_response(self, response, pending):
+                self.recorded.append(('on_response', response.request_id))
+
+            def on_pending_removed(self, request_id, pending, reason):
+                self.recorded.append(('hook', request_id, reason))
+
+        d, pool = self._make_dispatcher(RecordingDispatcher)
+        client = MockClient('GET', '/api/test')
+        pending = _PendingRequest(client, pool)
+        d._pending[1] = pending
+        response = Response(request_id=1, data={'ok': True}, status=200)
+        d._process_response((MSG_RESPONSE, 1, response))
+        self.assertEqual(d.recorded, [
+            ('on_response', 1),
+            ('hook', 1, PENDING_COMPLETED),
+        ])
+
+    def test_timeout_fires_hook(self):
+
+        class RecordingDispatcher(Dispatcher):
+            def on_pending_removed(self, request_id, pending, reason):
+                self.recorded.append((request_id, reason))
+
+        d, pool = self._make_dispatcher(RecordingDispatcher)
+        client = MockClient('GET', '/api/test')
+        pending = _PendingRequest(client, pool)
+        pending.timestamp = 0  # very old
+        d._pending[1] = pending
+        d._expire_pending()
+        self.assertNotIn(1, d._pending)
+        self.assertEqual(client.response_status, 504)
+        self.assertEqual(d.recorded, [(1, PENDING_TIMEOUT)])
+
+    def test_stream_closed_fires_hook(self):
+
+        class RecordingDispatcher(Dispatcher):
+            def on_pending_removed(self, request_id, pending, reason):
+                self.recorded.append((request_id, reason))
+
+        d, pool = self._make_dispatcher(RecordingDispatcher)
+        client = MockClient('GET', '/api/events')
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        d._pending[1] = pending
+        d._process_response((MSG_SSE_CLOSE, 1))
+        self.assertTrue(client.stream_ended)
+        self.assertEqual(d.recorded, [(1, PENDING_STREAM_CLOSED)])
+
+    def test_disconnect_fires_hook(self):
+
+        class RecordingDispatcher(Dispatcher):
+            def on_pending_removed(self, request_id, pending, reason):
+                self.recorded.append((request_id, reason))
+
+        d, pool = self._make_dispatcher(RecordingDispatcher)
+        client = MockClient('GET', '/api/events')
+        client._connected = False
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        pending.worker_id = None  # skip control queue routing
+        d._pending[1] = pending
+        d._process_response(
+            (MSG_SSE_EVENT, 1, {'data': 'x'}, 'ping', None, None))
+        self.assertNotIn(1, d._pending)
+        self.assertEqual(d.recorded, [(1, PENDING_DISCONNECTED)])
+
+    def test_shutdown_fires_hook(self):
+
+        class RecordingDispatcher(Dispatcher):
+            def on_pending_removed(self, request_id, pending, reason):
+                self.recorded.append((request_id, reason))
+
+        d, pool = self._make_dispatcher(RecordingDispatcher)
+
+        class FakeHttpServer:
+            def close(self):
+                pass
+
+        class FakePool:
+            def shutdown(self, timeout):
+                pass
+
+        d._http_server = FakeHttpServer()
+        d._pools = [FakePool()]
+        d._shutdown_timeout = 0.0  # skip drain loop immediately
+
+        client_a = MockClient('GET', '/api/a')
+        client_b = MockClient('GET', '/api/b')
+        d._pending[1] = _PendingRequest(client_a, pool)
+        d._pending[2] = _PendingRequest(client_b, pool)
+
+        d._shutdown()
+
+        self.assertEqual(client_a.response_status, 503)
+        self.assertEqual(client_b.response_status, 503)
+        self.assertEqual(sorted(d.recorded), [
+            (1, PENDING_SHUTDOWN),
+            (2, PENDING_SHUTDOWN),
+        ])
+        self.assertEqual(d._pending, {})
+
+    def test_hook_exception_is_swallowed_and_logged(self):
+
+        class BrokenDispatcher(Dispatcher):
+            def on_pending_removed(self, request_id, pending, reason):
+                raise RuntimeError('boom')
+
+        d, pool = self._make_dispatcher(BrokenDispatcher)
+        client = MockClient('GET', '/api/test')
+        pending = _PendingRequest(client, pool)
+        d._pending[1] = pending
+        response = Response(request_id=1, data={'ok': True}, status=200)
+        # must not propagate
+        d._process_response((MSG_RESPONSE, 1, response))
+        # client still got the response
+        self.assertTrue(client.responded)
+        self.assertEqual(client.response_status, 200)
+        # error was logged
+        error_logs = [
+            msg for _, level, msg in d.log_calls if level == LOG_ERROR]
+        self.assertEqual(len(error_logs), 1)
+        self.assertIn('on_pending_removed', error_logs[0])
+        self.assertIn('boom', error_logs[0])
+
+    def test_default_hook_is_noop(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/test')
+        pending = _PendingRequest(client, pool)
+        d._pending[1] = pending
+        response = Response(request_id=1, data={'ok': True}, status=200)
+        # base Dispatcher has no-op on_pending_removed → must not raise
+        d._process_response((MSG_RESPONSE, 1, response))
+        self.assertTrue(client.responded)
 
 
 if __name__ == '__main__':
