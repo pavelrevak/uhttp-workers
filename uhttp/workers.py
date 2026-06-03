@@ -36,6 +36,7 @@ PENDING_TIMEOUT = 'TIMEOUT'
 PENDING_DISCONNECTED = 'DISCONNECTED'
 PENDING_STREAM_CLOSED = 'STREAM_CLOSED'
 PENDING_SHUTDOWN = 'SHUTDOWN'
+PENDING_WORKER_DIED = 'WORKER_DIED'
 
 # Sentinel for deferred response
 DEFERRED = object()
@@ -879,7 +880,10 @@ class WorkerPool:
         """Check worker health, restart dead or stuck workers.
 
         Returns:
-            List of (worker_id, reason) tuples for restarted workers.
+            List of (worker_id, reason, exitcode) tuples for restarted
+            workers. exitcode is None for stuck workers (dispatcher killed
+            them), otherwise the process exit code (negative = signal:
+            -9 OOM, -11 SIGSEGV, -15 SIGTERM, etc.).
         """
         restarted = []
         now = _time.time()
@@ -889,8 +893,10 @@ class WorkerPool:
             if now - t < self.restart_window]
         for i, worker in enumerate(self.workers):
             reason = None
+            exitcode = None
             if not worker.is_alive():
-                reason = f"died exit={worker.exitcode}"
+                exitcode = worker.exitcode
+                reason = f"died exit={exitcode}"
             elif now - self._last_seen.get(i, 0) > self.stuck_timeout:
                 reason = "stuck"
                 worker.kill()
@@ -904,7 +910,7 @@ class WorkerPool:
                 if len(self._restart_times) >= self.max_restarts:
                     self._degraded = True
                 self._start_worker(i)
-                restarted.append((i, reason))
+                restarted.append((i, reason, exitcode))
         return restarted
 
     def matches(self, path):
@@ -960,6 +966,11 @@ class WorkerPool:
         return self._degraded
 
     @property
+    def alive_count(self):
+        """Number of worker processes currently alive."""
+        return sum(1 for w in self.workers if w.is_alive())
+
+    @property
     def pending_count(self):
         try:
             return self.request_queue.qsize()
@@ -976,6 +987,7 @@ class WorkerPool:
         return {
             'name': self.name,
             'degraded': self._degraded,
+            'alive_count': self.alive_count,
             'queue_size': self.pending_count,
             'workers': [
                 {
@@ -1127,6 +1139,9 @@ class Dispatcher:
                                     notified via control queue (race possible).
             PENDING_STREAM_CLOSED - worker ended the SSE stream cleanly.
             PENDING_SHUTDOWN      - dispatcher is shutting down; client got 503.
+            PENDING_WORKER_DIED   - worker process died/was killed while owning
+                                    this request; client got 500. on_worker_died()
+                                    runs first.
 
         Args:
             request_id: The request id being removed.
@@ -1200,6 +1215,11 @@ class Dispatcher:
         if pool.is_degraded:
             client.respond(
                 {'error': 'Service unavailable'}, status=503)
+            return
+        if pool.alive_count == 0:
+            client.respond(
+                {'error': 'No workers available'}, status=503,
+                headers={'Retry-After': '1'})
             return
         if len(self._pending) >= self._max_pending:
             client.respond(
@@ -1353,8 +1373,18 @@ class Dispatcher:
         """Check health of all worker pools and queue sizes."""
         for pool in self._pools:
             restarted = pool.check_workers()
-            for worker_id, reason in restarted:
-                self._on_worker_restarted(pool, worker_id, reason)
+            for worker_id, reason, exitcode in restarted:
+                victims = [
+                    (rid, p) for rid, p in self._pending.items()
+                    if p.pool is pool and p.worker_id == worker_id]
+                try:
+                    self.on_worker_died(
+                        pool, worker_id, reason, exitcode, victims)
+                except Exception:
+                    self.on_log(
+                        pool.name, LOG_ERROR,
+                        f"on_worker_died() failed:\n"
+                        f"{_traceback.format_exc()}")
             if pool.queue_warning:
                 qsize = pool.pending_count
                 if qsize >= pool.queue_warning:
@@ -1390,14 +1420,57 @@ class Dispatcher:
             print(f"{prefix}{level_name:8s} {name:20s} {message}",
                 file=_sys.stderr)
 
-    def _on_worker_restarted(self, pool, worker_id, reason):
-        """Called when a worker is restarted.
+    def on_worker_died(self, pool, worker_id, reason, exitcode, victims):
+        """Called when a worker process died or was killed by the dispatcher.
 
-        Default logs the event. Override to customize.
+        Default behavior:
+          1. Log restart reason + each victim (request id, client address,
+             method, path, body size).
+          2. Respond 500 to every victim's client (or response_stream_end()
+             for streams), remove them from _pending, and fire
+             on_pending_removed(PENDING_WORKER_DIED) for each.
+
+        Override to capture victim payloads (e.g., persist to disk for
+        post-mortem) BEFORE calling super(). pending.client gives access
+        to method, path, headers, body, address.
+
+        Args:
+            pool: WorkerPool the worker belonged to.
+            worker_id: Index of the restarted worker.
+            reason: 'stuck' or 'died exit=N' (string from check_workers).
+            exitcode: Process exit code (int) or None for stuck workers.
+                Negative values are signals: -9 OOM, -11 SIGSEGV, etc.
+            victims: List of (request_id, _PendingRequest) tuples — requests
+                this worker had claimed (via MSG_HEARTBEAT) but never
+                completed. May be empty if worker died while idle.
         """
         self.on_log(
             f'{pool.name}[{worker_id}]', LOG_ERROR,
-            f"worker restarted: {reason}")
+            f"worker restarted: {reason}, "
+            f"victims={len(victims)}")
+        for request_id, pending in victims:
+            c = pending.client
+            body_len = len(c.body) if c.body is not None else 0
+            self.on_log(
+                pool.name, LOG_ERROR,
+                f"  victim rid={request_id} from={c.address} "
+                f"{c.method} {c.path} body={body_len}B")
+            del self._pending[request_id]
+            if pending.streaming:
+                try:
+                    pending.client.response_stream_end()
+                except Exception:
+                    pass
+            else:
+                try:
+                    pending.client.respond(
+                        {'error': 'Worker crashed',
+                         'reason': reason},
+                        status=500)
+                except Exception:
+                    pass
+            self._notify_pending_removed(
+                request_id, pending, PENDING_WORKER_DIED)
 
     def _sigterm(self, _signo, _stack_frame):
         self._running = False

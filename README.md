@@ -551,6 +551,7 @@ Reason is one of:
 | `PENDING_DISCONNECTED` | Client disconnected mid-stream; worker was notified via control queue (race possible). |
 | `PENDING_STREAM_CLOSED` | Worker ended the SSE stream cleanly. |
 | `PENDING_SHUTDOWN` | Dispatcher is shutting down; client got 503. |
+| `PENDING_WORKER_DIED` | Worker process died/was killed while owning the request; client got 500. `on_worker_died()` runs first. |
 
 The hook is invoked after the client-facing action (respond / disconnect / control queue put)
 so dispatcher state is finalized when it runs. Exceptions raised by the hook are logged at
@@ -560,6 +561,51 @@ Override `on_response()` if you only care about the happy path (e.g. cross-pool 
 Override `on_pending_removed()` if you need exactly-once cleanup. Overriding both is allowed
 but discouraged — for the `PENDING_COMPLETED` reason, `on_response()` is called immediately
 before `on_pending_removed()`.
+
+## Worker Death Hook
+
+Workers die — segfault in a C extension, OOM-kill, or the dispatcher kills them after
+`stuck_timeout`. Override `on_worker_died()` to capture which requests they had in-flight
+(useful for forensics when a malformed payload reproduces a crash):
+
+```python
+class MyDispatcher(_workers.Dispatcher):
+    def on_worker_died(
+            self, pool, worker_id, reason, exitcode, victims):
+        # `victims` is a list of (request_id, _PendingRequest) for all
+        # requests this worker had claimed but not completed.
+        # `exitcode` is None for stuck workers, otherwise the process exit
+        # code (negative = signal: -9 OOM, -11 SIGSEGV).
+        for rid, pending in victims:
+            c = pending.client
+            self._crash_queue.append({
+                'reason': reason,
+                'exitcode': exitcode,
+                'method': c.method,
+                'path': c.path,
+                'address': c.address,
+                'body': c.body,  # raw bytes — replay this to reproduce
+            })
+        # Default impl responds 500 to victims and fires
+        # on_pending_removed(PENDING_WORKER_DIED). Call it after capture.
+        super().on_worker_died(
+            pool, worker_id, reason, exitcode, victims)
+```
+
+What's a victim: any request the worker had claimed via `MSG_HEARTBEAT`
+(`pending.worker_id == worker_id`). Requests still in the queue (`worker_id is None`)
+are **not** victims — other workers in the pool will pick them up after restart.
+
+Default behavior (if you don't override) is to log the death + each victim, respond
+500 (or close the stream for SSE/NDJSON), and fire `on_pending_removed` for each.
+Override only if you want to persist payloads or customize the response status/body.
+
+**500 vs 503:** a victim of a crashed worker gets **500** (processing started, then
+the server failed). A new request arriving while the pool has zero alive workers
+gets **503 + `Retry-After: 1`** (rejected before processing — try again shortly).
+A request to a pool that has exceeded `max_restarts` in `restart_window` gets **503**
+permanently (`pool.is_degraded`). `pool.alive_count` is exposed for monitoring and
+also appears in `pool.status()`.
 
 ## Dispatcher Idle Hook
 

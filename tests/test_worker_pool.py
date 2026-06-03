@@ -120,6 +120,27 @@ class TestWorkerPoolStatus(unittest.TestCase):
         pool = WorkerPool(DummyWorker)
         self.assertFalse(pool.is_degraded)
 
+    def test_alive_count_empty(self):
+        pool = WorkerPool(DummyWorker, num_workers=2)
+        # not started yet
+        self.assertEqual(pool.alive_count, 0)
+
+    def test_alive_count_running(self):
+        pool = WorkerPool(DummyWorker, num_workers=2)
+        response_queue = mp.Queue()
+        pool.start(response_queue)
+        time.sleep(0.2)
+        self.assertEqual(pool.alive_count, 2)
+        pool.shutdown(timeout=3)
+
+    def test_alive_count_in_status(self):
+        pool = WorkerPool(DummyWorker, num_workers=2)
+        response_queue = mp.Queue()
+        pool.start(response_queue)
+        time.sleep(0.2)
+        self.assertEqual(pool.status()['alive_count'], 2)
+        pool.shutdown(timeout=3)
+
 
 class TestWorkerPoolCheckWorkers(unittest.TestCase):
 

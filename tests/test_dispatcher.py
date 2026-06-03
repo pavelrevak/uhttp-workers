@@ -13,7 +13,7 @@ from uhttp.workers import (
     MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE, MSG_NDJSON,
     CTL_DISCONNECT,
     PENDING_COMPLETED, PENDING_TIMEOUT, PENDING_DISCONNECTED,
-    PENDING_STREAM_CLOSED, PENDING_SHUTDOWN,
+    PENDING_STREAM_CLOSED, PENDING_SHUTDOWN, PENDING_WORKER_DIED,
     LOG_ERROR,
     _PendingRequest,
 )
@@ -29,13 +29,16 @@ class MockClient:
     """Mock HttpConnection for testing dispatcher logic."""
 
     def __init__(self, method='GET', path='/', query=None, data=None,
-            headers=None, content_type=None):
+            headers=None, content_type=None, body=None,
+            address='127.0.0.1'):
         self.method = method
         self.path = path
         self.query = query
         self.data = data
         self.headers = headers or {}
         self.content_type = content_type
+        self.body = body
+        self.address = address
         self.responded = False
         self.response_data = None
         self.response_status = None
@@ -188,6 +191,8 @@ class TestDispatcherDoCheck(unittest.TestCase):
 
     def test_pass_check(self):
         pool = WorkerPool(DummyWorker, routes=['/api/**'])
+        # fake a live worker so alive_count > 0 without starting processes
+        pool.workers = [type('W', (), {'is_alive': lambda self: True})()]
         d = Dispatcher.__new__(Dispatcher)
         d._sync_routes = []
         d._static_routes = {}
@@ -316,6 +321,48 @@ class TestDispatcherPoolRouting(unittest.TestCase):
         d._dispatch_to_pool(client)
         self.assertTrue(client.responded)
         self.assertEqual(client.response_status, 503)
+
+    def test_dispatch_no_alive_workers_returns_503(self):
+        """Transient: pool has workers but none currently alive."""
+        # pool has dead workers (not degraded yet)
+        self.pool_default.workers = [
+            type('W', (), {'is_alive': lambda self: False})()]
+        d = Dispatcher.__new__(Dispatcher)
+        d._sync_routes = []
+        d._static_routes = {}
+        d._pools = [self.pool_default]
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+
+        client = MockClient('GET', '/test')
+        d._dispatch_to_pool(client)
+        self.assertTrue(client.responded)
+        self.assertEqual(client.response_status, 503)
+        self.assertEqual(
+            client.response_data['error'], 'No workers available')
+        self.assertEqual(
+            client.response_headers.get('Retry-After'), '1')
+        # request was NOT enqueued
+        self.assertEqual(d._pending, {})
+
+    def test_dispatch_empty_workers_returns_503(self):
+        """Pool was never started (empty workers list)."""
+        # self.pool_default.workers is [] from __init__
+        d = Dispatcher.__new__(Dispatcher)
+        d._sync_routes = []
+        d._static_routes = {}
+        d._pools = [self.pool_default]
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+
+        client = MockClient('GET', '/test')
+        d._dispatch_to_pool(client)
+        self.assertTrue(client.responded)
+        self.assertEqual(client.response_status, 503)
+        self.assertEqual(
+            client.response_data['error'], 'No workers available')
 
 
 class TestDispatcherProcessResponse(unittest.TestCase):
@@ -767,6 +814,208 @@ class TestDispatcherPendingRemoved(unittest.TestCase):
         # base Dispatcher has no-op on_pending_removed → must not raise
         d._process_response((MSG_RESPONSE, 1, response))
         self.assertTrue(client.responded)
+
+
+class TestDispatcherWorkerDied(unittest.TestCase):
+    """Tests for on_worker_died hook and victim handling."""
+
+    def _make_dispatcher(self, dispatcher_cls=Dispatcher):
+        # queue_warning=0 disables the queue-size check (which would
+        # otherwise touch pool.pending_count → request_queue.qsize()).
+        pool = WorkerPool(
+            DummyWorker, routes=['/api/**'], queue_warning=0)
+        # Mock check_workers so we control what it returns without
+        # actually starting processes.
+        pool._fake_restarted = []
+        pool.check_workers = lambda: pool._fake_restarted
+        d = dispatcher_cls.__new__(dispatcher_cls)
+        d._sync_routes = []
+        d._static_routes = {}
+        d._pools = [pool]
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+        d._response_queue = mp.Queue()
+        d._log_is_tty = False
+        d.log_calls = []
+        d.on_log = lambda name, level, msg: d.log_calls.append(
+            (name, level, msg))
+        d.recorded_removed = []
+        return d, pool
+
+    def test_single_victim_gets_500(self):
+
+        class RecordingDispatcher(Dispatcher):
+            def on_pending_removed(self, request_id, pending, reason):
+                self.recorded_removed.append((request_id, reason))
+
+        d, pool = self._make_dispatcher(RecordingDispatcher)
+        client = MockClient(
+            'POST', '/api/scan', body=b'\x00\x01bad', address='10.0.0.7')
+        pending = _PendingRequest(client, pool)
+        pending.worker_id = 0
+        d._pending[42] = pending
+        pool._fake_restarted = [(0, 'died exit=-11', -11)]
+        d._check_all_workers()
+        # client got 500
+        self.assertTrue(client.responded)
+        self.assertEqual(client.response_status, 500)
+        self.assertEqual(client.response_data['error'], 'Worker crashed')
+        self.assertIn('exit=-11', client.response_data['reason'])
+        # removed from pending + hook fired
+        self.assertNotIn(42, d._pending)
+        self.assertEqual(
+            d.recorded_removed, [(42, PENDING_WORKER_DIED)])
+
+    def test_multiple_victims_all_handled(self):
+        d, pool = self._make_dispatcher()
+        c1 = MockClient('GET', '/api/a', address='1.1.1.1')
+        c2 = MockClient('GET', '/api/b', address='2.2.2.2')
+        c3 = MockClient('GET', '/api/c', address='3.3.3.3')
+        for rid, c in [(1, c1), (2, c2), (3, c3)]:
+            p = _PendingRequest(c, pool)
+            p.worker_id = 0
+            d._pending[rid] = p
+        pool._fake_restarted = [(0, 'stuck', None)]
+        d._check_all_workers()
+        for c in (c1, c2, c3):
+            self.assertTrue(c.responded)
+            self.assertEqual(c.response_status, 500)
+        self.assertEqual(d._pending, {})
+
+    def test_streaming_victim_gets_stream_end(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/events')
+        pending = _PendingRequest(client, pool)
+        pending.worker_id = 0
+        pending.streaming = True
+        d._pending[1] = pending
+        pool._fake_restarted = [(0, 'died exit=-9', -9)]
+        d._check_all_workers()
+        # stream ended, NOT respond()
+        self.assertTrue(getattr(client, 'stream_ended', False))
+        self.assertFalse(client.responded)
+        self.assertNotIn(1, d._pending)
+
+    def test_queued_request_not_a_victim(self):
+        """Request with worker_id=None is still in queue — not a victim."""
+        d, pool = self._make_dispatcher()
+        # request belonging to dying worker
+        in_flight = MockClient('GET', '/api/active')
+        p1 = _PendingRequest(in_flight, pool)
+        p1.worker_id = 0
+        d._pending[1] = p1
+        # request still in queue, no worker claimed it
+        queued = MockClient('GET', '/api/queued')
+        p2 = _PendingRequest(queued, pool)
+        # p2.worker_id stays None
+        d._pending[2] = p2
+        pool._fake_restarted = [(0, 'died exit=-11', -11)]
+        d._check_all_workers()
+        # in-flight responded
+        self.assertTrue(in_flight.responded)
+        self.assertNotIn(1, d._pending)
+        # queued untouched
+        self.assertFalse(queued.responded)
+        self.assertIn(2, d._pending)
+
+    def test_other_worker_not_affected(self):
+        """Only victims of THIS worker are handled; other workers stay."""
+        d, pool = self._make_dispatcher()
+        c1 = MockClient('GET', '/api/a')
+        c2 = MockClient('GET', '/api/b')
+        p1 = _PendingRequest(c1, pool)
+        p1.worker_id = 0
+        p2 = _PendingRequest(c2, pool)
+        p2.worker_id = 1
+        d._pending[1] = p1
+        d._pending[2] = p2
+        pool._fake_restarted = [(0, 'died exit=-11', -11)]
+        d._check_all_workers()
+        self.assertTrue(c1.responded)
+        self.assertNotIn(1, d._pending)
+        self.assertFalse(c2.responded)
+        self.assertIn(2, d._pending)
+
+    def test_late_response_after_victim_cleanup_dropped(self):
+        """MSG_RESPONSE from dead worker arriving after victim removal is dropped."""
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/test')
+        pending = _PendingRequest(client, pool)
+        pending.worker_id = 0
+        d._pending[1] = pending
+        pool._fake_restarted = [(0, 'died exit=-11', -11)]
+        d._check_all_workers()
+        # request already gone; client already got 500
+        self.assertEqual(client.response_status, 500)
+        # late response from before-death — must not break or double-respond
+        client.response_status = None
+        late = Response(request_id=1, data={'ok': True}, status=200)
+        d._process_response((MSG_RESPONSE, 1, late))
+        # silently dropped
+        self.assertIsNone(client.response_status)
+
+    def test_no_victims_just_logs(self):
+        """Worker died while idle — restarted but no pending requests."""
+        d, pool = self._make_dispatcher()
+        pool._fake_restarted = [(0, 'died exit=0', 0)]
+        d._check_all_workers()
+        # no crash, no pending changes
+        self.assertEqual(d._pending, {})
+        # should have logged
+        error_logs = [
+            msg for _, level, msg in d.log_calls if level == LOG_ERROR]
+        self.assertEqual(len(error_logs), 1)
+        self.assertIn('victims=0', error_logs[0])
+
+    def test_override_can_persist_payload(self):
+        """User override can capture victim payload before super() responds."""
+        captured = []
+
+        class ForensicDispatcher(Dispatcher):
+            def on_worker_died(
+                    self, pool, worker_id, reason, exitcode, victims):
+                for rid, pending in victims:
+                    captured.append({
+                        'rid': rid,
+                        'address': pending.client.address,
+                        'body': pending.client.body,
+                        'reason': reason,
+                        'exitcode': exitcode})
+                super().on_worker_died(
+                    pool, worker_id, reason, exitcode, victims)
+
+        d, pool = self._make_dispatcher(ForensicDispatcher)
+        client = MockClient(
+            'POST', '/api/process',
+            body=b'\xff\xfecorrupted', address='9.9.9.9')
+        pending = _PendingRequest(client, pool)
+        pending.worker_id = 0
+        d._pending[7] = pending
+        pool._fake_restarted = [(0, 'died exit=-11', -11)]
+        d._check_all_workers()
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]['address'], '9.9.9.9')
+        self.assertEqual(captured[0]['body'], b'\xff\xfecorrupted')
+        self.assertEqual(captured[0]['exitcode'], -11)
+        # super() still ran
+        self.assertEqual(client.response_status, 500)
+
+    def test_hook_exception_does_not_crash_dispatcher(self):
+
+        class BrokenDispatcher(Dispatcher):
+            def on_worker_died(self, *args, **kwargs):
+                raise RuntimeError('boom')
+
+        d, pool = self._make_dispatcher(BrokenDispatcher)
+        pool._fake_restarted = [(0, 'died exit=-11', -11)]
+        # must not propagate
+        d._check_all_workers()
+        error_logs = [
+            msg for _, level, msg in d.log_calls if level == LOG_ERROR]
+        # one error log about the hook failure
+        self.assertTrue(any('on_worker_died' in m for m in error_logs))
+        self.assertTrue(any('boom' in m for m in error_logs))
 
 
 if __name__ == '__main__':
