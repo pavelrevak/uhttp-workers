@@ -18,6 +18,17 @@ class TestRequest(unittest.TestCase):
         self.assertEqual(req.headers, {})
         self.assertIsNone(req.content_type)
         self.assertEqual(req.path_params, {})
+        self.assertIsNone(req.remote_address)
+
+    def test_remote_address(self):
+        req = Request(1, 'GET', '/', remote_address='10.0.0.1:54321')
+        self.assertEqual(req.remote_address, '10.0.0.1:54321')
+
+    def test_pickle_remote_address(self):
+        req = Request(
+            1, 'GET', '/', remote_address='2001:db8::1:54321')
+        restored = pickle.loads(pickle.dumps(req))
+        self.assertEqual(restored.remote_address, '2001:db8::1:54321')
 
     def test_full_creation(self):
         req = Request(

@@ -215,16 +215,22 @@ class Request:
         headers: Request headers dict.
         content_type: Content-Type header value, or None.
         path_params: Path parameters filled by worker router.
+        remote_address: Client address as "host:port" string. Honors
+            X-Forwarded-For when the connection comes from a trusted
+            proxy (uhttp-server's trusted_proxies setting). None if the
+            dispatcher could not resolve the address (e.g., in tests).
     """
 
     __slots__ = (
         'request_id', 'method', 'path', 'query',
         'data', 'headers', 'content_type', 'path_params',
+        'remote_address',
         '_cookies', '_response_queue')
 
     def __init__(
             self, request_id, method, path, query=None,
-            data=None, headers=None, content_type=None):
+            data=None, headers=None, content_type=None,
+            remote_address=None):
         self.request_id = request_id
         self.method = method
         self.path = path
@@ -233,6 +239,7 @@ class Request:
         self.headers = headers or {}
         self.content_type = content_type
         self.path_params = {}
+        self.remote_address = remote_address
         self._cookies = None
         self._response_queue = None
 
@@ -1235,7 +1242,8 @@ class Dispatcher:
             query=client.query,
             data=client.data,
             headers=dict(client.headers),
-            content_type=client.content_type))
+            content_type=client.content_type,
+            remote_address=client.remote_address))
 
     def _http_request(self, client):
         """Process incoming HTTP request."""
@@ -1453,7 +1461,7 @@ class Dispatcher:
             body_len = len(c.body) if c.body is not None else 0
             self.on_log(
                 pool.name, LOG_ERROR,
-                f"  victim rid={request_id} from={c.address} "
+                f"  victim rid={request_id} from={c.remote_address} "
                 f"{c.method} {c.path} body={body_len}B")
             del self._pending[request_id]
             if pending.streaming:

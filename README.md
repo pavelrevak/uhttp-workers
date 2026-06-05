@@ -263,15 +263,18 @@ Workers send heartbeats automatically via the shared response queue. When a work
 ```python
 @_workers.api('/process/{id:int}', 'POST')
 def process(self, request):
-    # request.request_id  — internal ID for dispatcher pairing
-    # request.method       — 'POST'
-    # request.path         — '/process/42'
-    # request.path_params  — {'id': 42}
-    # request.query        — {'page': '1'} or None
-    # request.data         — dict (JSON), bytes (binary), or None
-    # request.headers      — dict
-    # request.cookies      — dict (lazy-parsed from Cookie header)
-    # request.content_type — 'application/json'
+    # request.request_id     — internal ID for dispatcher pairing
+    # request.method          — 'POST'
+    # request.path            — '/process/42'
+    # request.path_params     — {'id': 42}
+    # request.query           — {'page': '1'} or None
+    # request.data            — dict (JSON), bytes (binary), or None
+    # request.headers         — dict
+    # request.cookies         — dict (lazy-parsed from Cookie header)
+    # request.content_type    — 'application/json'
+    # request.remote_address  — 'host:port' string (honors X-Forwarded-For
+    #                            from trusted proxies; configured on the
+    #                            HTTP server side)
 
     # return data (status 200)
     return {'result': 'ok'}

@@ -30,7 +30,7 @@ class MockClient:
 
     def __init__(self, method='GET', path='/', query=None, data=None,
             headers=None, content_type=None, body=None,
-            address='127.0.0.1'):
+            remote_address='127.0.0.1:0'):
         self.method = method
         self.path = path
         self.query = query
@@ -38,7 +38,7 @@ class MockClient:
         self.headers = headers or {}
         self.content_type = content_type
         self.body = body
-        self.address = address
+        self.remote_address = remote_address
         self.responded = False
         self.response_data = None
         self.response_status = None
@@ -363,6 +363,26 @@ class TestDispatcherPoolRouting(unittest.TestCase):
         self.assertEqual(client.response_status, 503)
         self.assertEqual(
             client.response_data['error'], 'No workers available')
+
+    def test_dispatch_forwards_remote_address(self):
+        """Request enqueued to worker carries client.remote_address."""
+        # fake an alive worker so dispatch reaches enqueue
+        self.pool_default.workers = [
+            type('W', (), {'is_alive': lambda self: True})()]
+        d = Dispatcher.__new__(Dispatcher)
+        d._sync_routes = []
+        d._static_routes = {}
+        d._pools = [self.pool_default]
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+
+        client = MockClient(
+            'GET', '/test', remote_address='198.51.100.7:33421')
+        d._dispatch_to_pool(client)
+        # request was enqueued
+        req = self.pool_default.request_queue.get(timeout=1)
+        self.assertEqual(req.remote_address, '198.51.100.7:33421')
 
 
 class TestDispatcherProcessResponse(unittest.TestCase):
@@ -851,7 +871,8 @@ class TestDispatcherWorkerDied(unittest.TestCase):
 
         d, pool = self._make_dispatcher(RecordingDispatcher)
         client = MockClient(
-            'POST', '/api/scan', body=b'\x00\x01bad', address='10.0.0.7')
+            'POST', '/api/scan', body=b'\x00\x01bad',
+            remote_address='10.0.0.7:42')
         pending = _PendingRequest(client, pool)
         pending.worker_id = 0
         d._pending[42] = pending
@@ -869,9 +890,9 @@ class TestDispatcherWorkerDied(unittest.TestCase):
 
     def test_multiple_victims_all_handled(self):
         d, pool = self._make_dispatcher()
-        c1 = MockClient('GET', '/api/a', address='1.1.1.1')
-        c2 = MockClient('GET', '/api/b', address='2.2.2.2')
-        c3 = MockClient('GET', '/api/c', address='3.3.3.3')
+        c1 = MockClient('GET', '/api/a', remote_address='1.1.1.1:42')
+        c2 = MockClient('GET', '/api/b', remote_address='2.2.2.2:42')
+        c3 = MockClient('GET', '/api/c', remote_address='3.3.3.3:42')
         for rid, c in [(1, c1), (2, c2), (3, c3)]:
             p = _PendingRequest(c, pool)
             p.worker_id = 0
@@ -978,7 +999,7 @@ class TestDispatcherWorkerDied(unittest.TestCase):
                 for rid, pending in victims:
                     captured.append({
                         'rid': rid,
-                        'address': pending.client.address,
+                        'remote_address': pending.client.remote_address,
                         'body': pending.client.body,
                         'reason': reason,
                         'exitcode': exitcode})
@@ -988,14 +1009,14 @@ class TestDispatcherWorkerDied(unittest.TestCase):
         d, pool = self._make_dispatcher(ForensicDispatcher)
         client = MockClient(
             'POST', '/api/process',
-            body=b'\xff\xfecorrupted', address='9.9.9.9')
+            body=b'\xff\xfecorrupted', remote_address='9.9.9.9:42')
         pending = _PendingRequest(client, pool)
         pending.worker_id = 0
         d._pending[7] = pending
         pool._fake_restarted = [(0, 'died exit=-11', -11)]
         d._check_all_workers()
         self.assertEqual(len(captured), 1)
-        self.assertEqual(captured[0]['address'], '9.9.9.9')
+        self.assertEqual(captured[0]['remote_address'], '9.9.9.9:42')
         self.assertEqual(captured[0]['body'], b'\xff\xfecorrupted')
         self.assertEqual(captured[0]['exitcode'], -11)
         # super() still ran
