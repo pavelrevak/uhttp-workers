@@ -700,6 +700,33 @@ class MyDispatcher(_workers.Dispatcher):
 
 Set dispatcher log level via constructor: `Dispatcher(log_level=LOG_DEBUG, ...)` (default `LOG_INFO`).
 
+### Logger Names
+
+Each logger is named after its class — `MyWorker[0]` for worker 0, `MyDispatcher`
+for the dispatcher. Override the `LOG_NAME` class attribute to customize:
+
+```python
+class MyWorker(_workers.Worker):
+    LOG_NAME = "api-{pool_name}-{worker_id}"   # → "api-MyWorker-0"
+
+class MyDispatcher(_workers.Dispatcher):
+    LOG_NAME = "gateway-{pid}"                  # → "gateway-12345"
+```
+
+`LOG_NAME` is a format template. Available placeholders:
+
+| Placeholder | Worker | Dispatcher | Value |
+|---|---|---|---|
+| `{cls}` | ✓ | ✓ | class name |
+| `{worker_id}` | ✓ | — | worker index in pool |
+| `{pool_name}` | ✓ | — | owning pool name |
+| `{pid}` | ✓ | ✓ | process PID |
+
+The defaults are themselves templates — `'{cls}[{worker_id}]'` for workers and `'{cls}'`
+for the dispatcher — so overriding `LOG_NAME` gives you the whole name. The worker index
+is only present if your template includes `{worker_id}`. An invalid placeholder logs a
+warning and falls back to the built-in default name.
+
 **Log levels:** `LOG_DEBUG` (10), `LOG_INFO` (20), `LOG_WARNING` (30), `LOG_ERROR` (40), `LOG_CRITICAL` (50)
 
 Check current level with `is_*` properties to skip expensive formatting:

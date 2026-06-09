@@ -96,6 +96,40 @@ class MockClient:
         self.stream_ended = True
 
 
+class TestDispatcherLogName(unittest.TestCase):
+    """Dispatcher._format_log_name (LOG_NAME template resolution)."""
+
+    def test_default_name(self):
+        d = Dispatcher()
+        self.assertEqual(d.log.name, 'Dispatcher')
+
+    def test_template_pid(self):
+        class NamedDispatcher(Dispatcher):
+            LOG_NAME = 'dispatch-{pid}'
+
+        d = NamedDispatcher()
+        self.assertEqual(d.log.name, 'dispatch-%d' % os.getpid())
+
+    def test_template_cls(self):
+        class NamedDispatcher(Dispatcher):
+            LOG_NAME = 'main:{cls}'
+
+        d = NamedDispatcher()
+        self.assertEqual(d.log.name, 'main:NamedDispatcher')
+
+    def test_bad_placeholder_falls_back(self):
+        class BadDispatcher(Dispatcher):
+            LOG_NAME = '{nope}'
+
+            def on_log(self, name, level, message):
+                self.captured = getattr(self, 'captured', [])
+                self.captured.append((level, message))
+
+        d = BadDispatcher()
+        self.assertEqual(d.log.name, 'BadDispatcher')
+        self.assertEqual(len(d.captured), 1)
+
+
 class TestDispatcherSyncRoutes(unittest.TestCase):
 
     def test_sync_handler_called(self):

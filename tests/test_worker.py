@@ -1,5 +1,6 @@
 """Tests for Worker request handling and routing."""
 
+import os
 import time
 import types
 import unittest
@@ -806,6 +807,42 @@ class TestWorkerMemoryLimit(unittest.TestCase):
         with mock.patch('uhttp.workers._resource') as res:
             res.setrlimit.side_effect = ValueError('bad limit')
             worker._apply_memory_limit()  # must not raise
+        self.assertEqual(len(warnings), 1)
+
+
+class TestWorkerLogName(unittest.TestCase):
+    """Worker._format_log_name (LOG_NAME template resolution)."""
+
+    def _make_worker(self, log_name=None, pool_name=None):
+        queues = [mp.Queue() for _ in range(3)]
+        worker = SimpleWorker(0, *queues, pool_name=pool_name)
+        if log_name is not None:
+            worker.LOG_NAME = log_name
+        return worker
+
+    def test_default_name(self):
+        worker = self._make_worker()
+        self.assertEqual(worker._format_log_name(), 'SimpleWorker[0]')
+
+    def test_template_worker_id(self):
+        worker = self._make_worker(log_name='Api[{worker_id}]')
+        self.assertEqual(worker._format_log_name(), 'Api[0]')
+
+    def test_template_cls_and_pool(self):
+        worker = self._make_worker(
+            log_name='{cls}-{pool_name}-{worker_id}', pool_name='pool')
+        self.assertEqual(worker._format_log_name(), 'SimpleWorker-pool-0')
+
+    def test_template_pid(self):
+        worker = self._make_worker(log_name='w-{pid}')
+        self.assertEqual(worker._format_log_name(), 'w-%d' % os.getpid())
+
+    def test_bad_placeholder_falls_back(self):
+        worker = self._make_worker(log_name='{nope}')
+        warnings = []
+        worker.log = types.SimpleNamespace(
+            warning=lambda *args: warnings.append(args))
+        self.assertEqual(worker._format_log_name(), 'SimpleWorker[0]')
         self.assertEqual(len(warnings), 1)
 
 

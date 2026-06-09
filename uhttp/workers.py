@@ -446,6 +446,10 @@ class Worker(_mp.Process):
 
     Attributes:
         HANDLERS: List of ApiHandler subclasses with grouped endpoints.
+        LOG_NAME: Logger name template, formatted with {cls}, {worker_id},
+            {pool_name}, {pid}. Default '{cls}[{worker_id}]'; override to
+            customize (e.g. 'api-{pool_name}-{worker_id}'). {pid} is the
+            worker process PID.
         worker_id: Unique index of this worker within its pool.
         heartbeat_interval: Seconds between heartbeats when idle.
         kwargs: Extra arguments from WorkerPool, accessible in setup().
@@ -453,6 +457,7 @@ class Worker(_mp.Process):
     """
 
     HANDLERS = []
+    LOG_NAME = '{cls}[{worker_id}]'
 
     def __init__(
             self, worker_id, request_queue, control_queue,
@@ -740,10 +745,32 @@ class Worker(_mp.Process):
         except (ValueError, OSError) as err:
             self.log.warning("RLIMIT_AS %d MB failed: %s", limit_mb, err)
 
+    def _format_log_name(self):
+        """Resolve the logger name from the LOG_NAME template.
+
+        Called in run() (child process) so {pid} is the worker's PID, not
+        the dispatcher's. Falls back to a safe default on a bad template.
+        """
+        ctx = {
+            'cls': type(self).__name__,
+            'worker_id': self.worker_id,
+            'pool_name': self.pool_name,
+            'pid': _os.getpid(),
+        }
+        try:
+            return self.LOG_NAME.format(**ctx)
+        except (KeyError, IndexError, ValueError) as err:
+            self.log.warning(
+                "invalid LOG_NAME %r: %s — using default",
+                self.LOG_NAME, err)
+            return f'{type(self).__name__}[{self.worker_id}]'
+
     def run(self):
         """Worker main loop using select for multiplexing."""
         _signal.signal(_signal.SIGTERM, lambda *_: None)
         _signal.signal(_signal.SIGINT, lambda *_: None)
+        # finalize logger name in the child so {pid} is this process's PID
+        self.log.name = self._format_log_name()
         # apply before setup() so the cap also bounds work done there
         self._apply_memory_limit()
         try:
@@ -751,8 +778,7 @@ class Worker(_mp.Process):
             self.setup()
         except Exception:
             self._response_queue.put(
-                (MSG_LOG, f'{type(self).__name__}[{self.worker_id}]',
-                 LOG_CRITICAL,
+                (MSG_LOG, self.log.name, LOG_CRITICAL,
                  f"setup() failed:\n{_traceback.format_exc()}"))
             return
         req_reader = self._request_queue._reader
@@ -1077,9 +1103,14 @@ class Dispatcher:
     Routes API requests to worker pools via queues. Uses select()-based
     event loop for multiplexing HTTP sockets, response queue, and custom
     file descriptors.
+
+    Attributes:
+        LOG_NAME: Logger name template, formatted with {cls} and {pid}.
+            Default '{cls}'; override to customize (e.g. 'gateway-{pid}').
     """
 
     SELECT_TIMEOUT = 1
+    LOG_NAME = '{cls}'
 
     def __init__(
             self, port=8080, address='0.0.0.0', pools=None,
@@ -1132,7 +1163,23 @@ class Dispatcher:
             type(self).__name__,
             sink=self.on_log,
             level=log_level)
+        self.log.name = self._format_log_name()
         self._build_sync_routes()
+
+    def _format_log_name(self):
+        """Resolve the logger name from the LOG_NAME template.
+
+        Formatted with {cls} and {pid} (the dispatcher process PID).
+        Falls back to the class name on a bad template.
+        """
+        ctx = {'cls': type(self).__name__, 'pid': _os.getpid()}
+        try:
+            return self.LOG_NAME.format(**ctx)
+        except (KeyError, IndexError, ValueError) as err:
+            self.log.warning(
+                "invalid LOG_NAME %r: %s — using default",
+                self.LOG_NAME, err)
+            return type(self).__name__
 
     def _build_sync_routes(self):
         """Collect @sync decorated methods and build sync route table."""
