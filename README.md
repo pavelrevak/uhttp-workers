@@ -220,6 +220,20 @@ class MyWorker(_workers.Worker):
 
 Extra keyword arguments from `WorkerPool(...)` are available as `self.kwargs`.
 
+### Memory Limit
+
+Pass `worker_memory_limit_mb=<MB>` (a recognized worker kwarg) to cap each worker's
+address space via `RLIMIT_AS`:
+
+```python
+WorkerPool(MyWorker, num_workers=4, worker_memory_limit_mb=512)
+```
+
+A runaway allocation then hits `ENOMEM` and the worker dies cleanly — the pool restarts
+the slot — instead of exhausting host RAM. Defense-in-depth for handling untrusted input.
+The cap is applied before `setup()`, so it also bounds any initialization done there.
+POSIX only (no-op on Windows); `setrlimit` failures are logged, not fatal.
+
 ### Teardown
 
 `teardown()` is called once when the worker process is stopping — use it to release resources:
@@ -512,7 +526,7 @@ Override `on_response()` on the dispatcher to post-process after a response is s
 ```python
 class MyDispatcher(_workers.Dispatcher):
     def on_response(self, response, pending):
-        if response.status == 200 and pending.pool.name == 'LprWorker':
+        if response.status == 200 and pending.pool.name == 'ImageWorker':
             storage_pool = self._find_pool('/internal/storage')
             storage_pool.request_queue.put(_workers.Request(
                 request_id=-1,
@@ -609,6 +623,13 @@ gets **503 + `Retry-After: 1`** (rejected before processing — try again shortl
 A request to a pool that has exceeded `max_restarts` in `restart_window` gets **503**
 permanently (`pool.is_degraded`). `pool.alive_count` is exposed for monitoring and
 also appears in `pool.status()`.
+
+By default degraded is **sticky** — once set it stays until restart. Pass
+`recovery_interval=<seconds>` to let the pool auto-recover: that many seconds after
+entering degraded, the flag and restart counter are cleared and workers get a fresh
+chance. Useful for transient failures that resolve on their own. The dispatcher logs
+a `WARNING` when a pool enters degraded and an
+`INFO` when it recovers.
 
 ## Dispatcher Idle Hook
 
@@ -739,6 +760,7 @@ Errors are logged automatically:
 | `max_restarts` | 10 | Max restarts per `restart_window` |
 | `restart_window` | 300 | Time window for restart counting (seconds) |
 | `queue_warning` | 100 | Log warning when queue size exceeds this (0 = disable) |
+| `recovery_interval` | None | Seconds before auto-recovering from degraded (None = sticky) |
 
 Extra `**kwargs` on `WorkerPool` are passed to worker constructor (accessible as `self.kwargs`).
 

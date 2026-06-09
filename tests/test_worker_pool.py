@@ -186,6 +186,72 @@ class TestWorkerPoolCheckWorkers(unittest.TestCase):
         self.assertTrue(pool.is_degraded)
         pool.shutdown(timeout=3)
 
+    def test_degraded_since_set_once(self):
+        """_degraded_since records first entry, not every later restart."""
+        pool = WorkerPool(
+            DummyWorker, num_workers=1,
+            max_restarts=2, restart_window=60)
+        response_queue = mp.Queue()
+        pool.start(response_queue)
+        for _ in range(2):
+            pool.workers[0].kill()
+            pool.workers[0].join(timeout=2)
+            pool.check_workers()
+            time.sleep(0.1)
+        self.assertTrue(pool.is_degraded)
+        first_since = pool._degraded_since
+        self.assertIsNotNone(first_since)
+        # further restarts must not move the timestamp
+        for _ in range(2):
+            pool.workers[0].kill()
+            pool.workers[0].join(timeout=2)
+            pool.check_workers()
+            time.sleep(0.1)
+        self.assertEqual(pool._degraded_since, first_since)
+        pool.shutdown(timeout=3)
+
+
+class TestWorkerPoolRecovery(unittest.TestCase):
+    """Auto-recovery from degraded via recovery_interval."""
+
+    def test_default_is_sticky(self):
+        """recovery_interval=None never auto-recovers (no workers needed)."""
+        pool = WorkerPool(DummyWorker, num_workers=0)
+        pool._degraded = True
+        pool._degraded_since = time.time() - 1000
+        pool._restart_times = [time.time()]
+        pool.check_workers()
+        self.assertTrue(pool.is_degraded)
+        self.assertEqual(len(pool._restart_times), 1)  # not cleared
+
+    def test_recovery_clears_degraded(self):
+        pool = WorkerPool(
+            DummyWorker, num_workers=0, recovery_interval=1)
+        pool._degraded = True
+        pool._degraded_since = time.time() - 2  # elapsed
+        pool._restart_times = [time.time() - 0.5]
+        pool.check_workers()
+        self.assertFalse(pool.is_degraded)
+        self.assertIsNone(pool._degraded_since)
+        self.assertEqual(pool._restart_times, [])
+
+    def test_recovery_not_yet_elapsed(self):
+        pool = WorkerPool(
+            DummyWorker, num_workers=0, recovery_interval=100)
+        now = time.time()
+        pool._degraded = True
+        pool._degraded_since = now  # just entered
+        pool._restart_times = [now]
+        pool.check_workers()
+        self.assertTrue(pool.is_degraded)
+        self.assertIsNotNone(pool._degraded_since)
+
+    def test_recovery_interval_property(self):
+        pool = WorkerPool(DummyWorker, recovery_interval=42)
+        self.assertEqual(pool.recovery_interval, 42)
+        pool2 = WorkerPool(DummyWorker)
+        self.assertIsNone(pool2.recovery_interval)
+
 
 if __name__ == '__main__':
     unittest.main()

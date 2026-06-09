@@ -1,8 +1,10 @@
 """Tests for Worker request handling and routing."""
 
 import time
+import types
 import unittest
 import multiprocessing as mp
+from unittest import mock
 
 from uhttp.workers import (
     Worker, Request, Response, api, RejectRequest, DEFERRED,
@@ -767,6 +769,44 @@ class TestWorkerPauseResume(unittest.TestCase):
         self.assertFalse(request_queue.empty())
         req = request_queue.get_nowait()
         self.assertEqual(req.request_id, 2)
+
+
+class TestWorkerMemoryLimit(unittest.TestCase):
+    """Worker._apply_memory_limit (RLIMIT_AS cap via worker kwarg)."""
+
+    def _make_worker(self, **kwargs):
+        queues = [mp.Queue() for _ in range(3)]
+        return SimpleWorker(0, *queues, **kwargs)
+
+    def test_no_kwarg_is_noop(self):
+        worker = self._make_worker()
+        with mock.patch('uhttp.workers._resource') as res:
+            worker._apply_memory_limit()
+            res.setrlimit.assert_not_called()
+
+    def test_applies_limit(self):
+        worker = self._make_worker(worker_memory_limit_mb=256)
+        with mock.patch('uhttp.workers._resource') as res:
+            worker._apply_memory_limit()
+            nbytes = 256 * 1024 * 1024
+            res.setrlimit.assert_called_once_with(
+                res.RLIMIT_AS, (nbytes, nbytes))
+
+    def test_resource_unavailable_is_noop(self):
+        worker = self._make_worker(worker_memory_limit_mb=256)
+        # must not raise when the resource module is absent (Windows)
+        with mock.patch('uhttp.workers._resource', None):
+            worker._apply_memory_limit()
+
+    def test_setrlimit_error_is_logged(self):
+        worker = self._make_worker(worker_memory_limit_mb=256)
+        warnings = []
+        worker.log = types.SimpleNamespace(
+            warning=lambda *args: warnings.append(args))
+        with mock.patch('uhttp.workers._resource') as res:
+            res.setrlimit.side_effect = ValueError('bad limit')
+            worker._apply_memory_limit()  # must not raise
+        self.assertEqual(len(warnings), 1)
 
 
 if __name__ == '__main__':

@@ -14,7 +14,7 @@ from uhttp.workers import (
     CTL_DISCONNECT,
     PENDING_COMPLETED, PENDING_TIMEOUT, PENDING_DISCONNECTED,
     PENDING_STREAM_CLOSED, PENDING_SHUTDOWN, PENDING_WORKER_DIED,
-    LOG_ERROR,
+    LOG_ERROR, LOG_WARNING, LOG_INFO,
     _PendingRequest,
 )
 
@@ -459,6 +459,55 @@ class TestDispatcherExpirePending(unittest.TestCase):
         d._expire_pending()
         self.assertFalse(client.responded)
         self.assertIn(1, d._pending)
+
+
+class _FlipPool:
+    """Stub pool whose check_workers() flips degraded to a preset value."""
+
+    def __init__(self, before, after):
+        self.name = 'flip'
+        self.queue_warning = 0
+        self._degraded = before
+        self._after = after
+
+    @property
+    def is_degraded(self):
+        return self._degraded
+
+    def check_workers(self):
+        self._degraded = self._after
+        return []
+
+
+class TestDispatcherDegradedLogging(unittest.TestCase):
+    """_check_all_workers logs degraded entry/recovery transitions."""
+
+    def _run(self, before, after):
+        d = Dispatcher.__new__(Dispatcher)
+        d._pools = [_FlipPool(before, after)]
+        d._pending = {}
+        logs = []
+        d.on_log = lambda name, level, msg: logs.append((level, msg))
+        d._check_all_workers()
+        return logs
+
+    def test_logs_entering_degraded(self):
+        logs = self._run(False, True)
+        self.assertEqual(len(logs), 1)
+        level, msg = logs[0]
+        self.assertEqual(level, LOG_WARNING)
+        self.assertIn('degraded', msg)
+
+    def test_logs_recovery(self):
+        logs = self._run(True, False)
+        self.assertEqual(len(logs), 1)
+        level, msg = logs[0]
+        self.assertEqual(level, LOG_INFO)
+        self.assertIn('recovered', msg)
+
+    def test_no_log_when_stable(self):
+        self.assertEqual(self._run(False, False), [])
+        self.assertEqual(self._run(True, True), [])
 
 
 class TestDispatcherRoutePriority(unittest.TestCase):

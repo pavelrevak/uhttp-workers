@@ -13,6 +13,11 @@ import signal as _signal
 import select as _select
 import multiprocessing as _mp
 
+try:
+    import resource as _resource
+except ImportError:  # non-POSIX (e.g. Windows)
+    _resource = None
+
 import uhttp.server as _uhttp_server
 
 
@@ -716,10 +721,31 @@ class Worker(_mp.Process):
             data={'error': str(err)},
             status=500)
 
+    def _apply_memory_limit(self):
+        """Cap worker address space via RLIMIT_AS (POSIX only).
+
+        Recognized worker kwarg ``worker_memory_limit_mb``. Runaway
+        allocation hits ENOMEM and the worker dies cleanly (the pool
+        restarts the slot) instead of exhausting host RAM. No-op where
+        the `resource` module is absent (e.g. Windows) or the kwarg is
+        unset. setrlimit failures are logged, not fatal.
+        """
+        limit_mb = self.kwargs.get('worker_memory_limit_mb')
+        if not limit_mb or _resource is None:
+            return
+        nbytes = int(limit_mb) * 1024 * 1024
+        try:
+            # soft == hard: worker cannot raise it back after a near-crash
+            _resource.setrlimit(_resource.RLIMIT_AS, (nbytes, nbytes))
+        except (ValueError, OSError) as err:
+            self.log.warning("RLIMIT_AS %d MB failed: %s", limit_mb, err)
+
     def run(self):
         """Worker main loop using select for multiplexing."""
         _signal.signal(_signal.SIGTERM, lambda *_: None)
         _signal.signal(_signal.SIGINT, lambda *_: None)
+        # apply before setup() so the cap also bounds work done there
+        self._apply_memory_limit()
         try:
             self._build_routes()
             self.setup()
@@ -807,7 +833,8 @@ class WorkerPool:
             self, worker_class, num_workers=1, routes=None,
             timeout=30, stuck_timeout=60, heartbeat_interval=1,
             log_level=LOG_WARNING, max_restarts=10,
-            restart_window=300, queue_warning=100, **kwargs):
+            restart_window=300, queue_warning=100,
+            recovery_interval=None, **kwargs):
         """Initialize worker pool.
 
         Args:
@@ -823,6 +850,10 @@ class WorkerPool:
             restart_window: Time window for counting restarts (seconds).
             queue_warning: Log warning when queue size exceeds this value.
                 Set to 0 to disable.
+            recovery_interval: Seconds after entering degraded state before
+                the pool auto-recovers (clears degraded, resets restart
+                counter, gives workers a fresh chance). None = sticky
+                degraded (default, never auto-recovers).
             **kwargs: Extra arguments passed to worker constructor.
         """
         self.worker_class = worker_class
@@ -835,6 +866,7 @@ class WorkerPool:
         self.max_restarts = max_restarts
         self.restart_window = restart_window
         self.queue_warning = queue_warning
+        self._recovery_interval = recovery_interval
         self.kwargs = kwargs
         self.name = worker_class.__name__
         self.request_queue = _mp.Queue()
@@ -844,6 +876,7 @@ class WorkerPool:
         self._current_request = {}
         self._restart_times = []
         self._degraded = False
+        self._degraded_since = None
         self._response_queue = None
 
     def start(self, response_queue):
@@ -898,6 +931,14 @@ class WorkerPool:
         self._restart_times = [
             t for t in self._restart_times
             if now - t < self.restart_window]
+        # auto-recover from degraded after recovery_interval elapses
+        if (self._degraded and self._recovery_interval
+                and self._degraded_since is not None
+                and now - self._degraded_since >= self._recovery_interval):
+            # TODO: skip when all slots parked (parking task) — nothing to retry
+            self._degraded = False
+            self._degraded_since = None
+            self._restart_times = []
         for i, worker in enumerate(self.workers):
             reason = None
             exitcode = None
@@ -915,6 +956,8 @@ class WorkerPool:
                     pass
                 self._restart_times.append(now)
                 if len(self._restart_times) >= self.max_restarts:
+                    if not self._degraded:
+                        self._degraded_since = now
                     self._degraded = True
                 self._start_worker(i)
                 restarted.append((i, reason, exitcode))
@@ -971,6 +1014,10 @@ class WorkerPool:
     @property
     def is_degraded(self):
         return self._degraded
+
+    @property
+    def recovery_interval(self):
+        return self._recovery_interval
 
     @property
     def alive_count(self):
@@ -1380,7 +1427,14 @@ class Dispatcher:
     def _check_all_workers(self):
         """Check health of all worker pools and queue sizes."""
         for pool in self._pools:
+            was_degraded = pool.is_degraded
             restarted = pool.check_workers()
+            if pool.is_degraded and not was_degraded:
+                self.on_log(pool.name, LOG_WARNING, "entered degraded state")
+            elif was_degraded and not pool.is_degraded:
+                self.on_log(
+                    pool.name, LOG_INFO,
+                    "recovered from degraded, retrying workers")
             for worker_id, reason, exitcode in restarted:
                 victims = [
                     (rid, p) for rid, p in self._pending.items()
