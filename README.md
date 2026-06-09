@@ -184,6 +184,29 @@ dispatcher = Dispatcher(
 
 Static files are served directly by the dispatcher process with path traversal protection. Directory requests automatically serve `index.html` if present.
 
+A mount value may also be a dict for per-mount options:
+
+```python
+static_routes={
+    '/assets/': {
+        'path': '/var/www/assets',
+        'headers': {'Cache-Control': 'public, max-age=31536000, immutable'},
+        'authoritative': True,
+    },
+}
+```
+
+- **`headers`** — response headers attached to every file served from this mount.
+- **`authoritative`** (default `False`) — when `True`, the mount **owns its prefix**:
+  a missing file or blocked traversal returns **404** immediately instead of falling
+  through to sync handlers / worker pools. Use this when a catch-all pool
+  (`routes=['/']`) would otherwise swallow `/assets/missing.png` and answer only after
+  a full worker round-trip.
+
+Override **`on_static_served(client, file_path, status)`** for an access log — it fires
+on every 200, and on the 404 of an authoritative mount (`status` is `200` or `404`).
+Exceptions raised by the hook are logged and swallowed.
+
 ## Sync Handlers
 
 Lightweight handlers that run directly in the dispatcher process — no queue overhead. Define them as methods on the dispatcher class with the `@sync` decorator:

@@ -2,6 +2,7 @@
 
 import os
 import time
+import types
 import unittest
 import tempfile
 import multiprocessing as mp
@@ -254,11 +255,14 @@ class TestDispatcherStaticFiles(unittest.TestCase):
         d._sync_routes = []
         d._static_routes = {}
         d._static_headers = {}
+        d._static_authoritative = {}
         if static_routes:
             for prefix, value in static_routes.items():
                 if isinstance(value, dict):
                     path = value['path']
                     d._static_headers[prefix] = value.get('headers')
+                    d._static_authoritative[prefix] = value.get(
+                        'authoritative', False)
                 else:
                     path = value
                 d._static_routes[prefix] = os.path.abspath(path)
@@ -364,6 +368,85 @@ class TestDispatcherStaticFiles(unittest.TestCase):
         d = Dispatcher(static_routes={'/s/': '/tmp'})
         self.assertNotIn('/s/', d._static_headers)
         self.assertEqual(d._static_routes['/s/'], os.path.abspath('/tmp'))
+
+    def test_non_authoritative_missing_falls_through(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = self._make_dispatcher({'/static/': tmpdir})
+            client = MockClient('GET', '/static/missing.txt')
+            # _serve_static returns False → falls through (default behaviour)
+            self.assertFalse(d._serve_static(client))
+            self.assertFalse(client.responded)
+
+    def test_authoritative_missing_serves_404(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = self._make_dispatcher(
+                {'/static/': {'path': tmpdir, 'authoritative': True}})
+            client = MockClient('GET', '/static/missing.txt')
+            self.assertTrue(d._serve_static(client))
+            self.assertTrue(client.responded)
+            self.assertEqual(client.response_status, 404)
+
+    def test_authoritative_traversal_serves_404(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = self._make_dispatcher(
+                {'/static/': {'path': tmpdir, 'authoritative': True}})
+            client = MockClient('GET', '/static/../../../etc/passwd')
+            self.assertTrue(d._serve_static(client))
+            self.assertEqual(client.response_status, 404)
+
+    def test_authoritative_existing_file_served(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, 'a.txt')
+            with open(filepath, 'w') as f:
+                f.write('x')
+            d = self._make_dispatcher(
+                {'/static/': {'path': tmpdir, 'authoritative': True}})
+            client = MockClient('GET', '/static/a.txt')
+            self.assertTrue(d._serve_static(client))
+            self.assertEqual(client.file_path, filepath)
+
+    def test_on_static_served_fires_on_200(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, 'a.txt')
+            with open(filepath, 'w') as f:
+                f.write('x')
+            d = self._make_dispatcher({'/static/': tmpdir})
+            calls = []
+            d.on_static_served = lambda c, fp, st: calls.append((fp, st))
+            d._serve_static(MockClient('GET', '/static/a.txt'))
+            self.assertEqual(calls, [(filepath, 200)])
+
+    def test_on_static_served_fires_on_authoritative_404(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = self._make_dispatcher(
+                {'/static/': {'path': tmpdir, 'authoritative': True}})
+            calls = []
+            d.on_static_served = lambda c, fp, st: calls.append(st)
+            d._serve_static(MockClient('GET', '/static/missing.txt'))
+            self.assertEqual(calls, [404])
+
+    def test_on_static_served_silent_on_non_authoritative_miss(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = self._make_dispatcher({'/static/': tmpdir})
+            calls = []
+            d.on_static_served = lambda c, fp, st: calls.append(st)
+            d._serve_static(MockClient('GET', '/static/missing.txt'))
+            self.assertEqual(calls, [])
+
+    def test_on_static_served_exception_swallowed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, 'a.txt')
+            with open(filepath, 'w') as f:
+                f.write('x')
+            d = self._make_dispatcher({'/static/': tmpdir})
+            d.log = types.SimpleNamespace(error=lambda *a, **k: None)
+
+            def boom(client, fp, status):
+                raise RuntimeError('hook bug')
+
+            d.on_static_served = boom
+            # must not propagate — file was already served
+            self.assertTrue(d._serve_static(MockClient('GET', '/static/a.txt')))
 
 
 class TestDispatcherPoolRouting(unittest.TestCase):
@@ -640,6 +723,7 @@ class TestDispatcherRoutePriority(unittest.TestCase):
             d._sync_routes = []
             d._static_routes = {'/static/': os.path.abspath(tmpdir)}
             d._static_headers = {}
+            d._static_authoritative = {}
             d._pools = []
             d._pending = {}
             d._max_pending = 1000

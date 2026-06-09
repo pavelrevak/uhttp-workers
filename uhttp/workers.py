@@ -1123,8 +1123,11 @@ class Dispatcher:
             address: Listen address.
             pools: List of WorkerPool instances.
             static_routes: Dict of URL prefix -> filesystem path, or
-                -> {'path': ..., 'headers': {...}} to attach per-mount
-                response headers (e.g. Cache-Control).
+                -> {'path': ..., 'headers': {...}, 'authoritative': bool}.
+                'headers' attaches per-mount response headers (e.g.
+                Cache-Control). 'authoritative' (default False): when True,
+                the mount owns its prefix — a missing file or blocked
+                traversal returns 404 instead of falling through to pools.
             shutdown_timeout: Seconds to wait for workers on shutdown.
             max_pending: Max pending requests before rejecting (503).
             ssl_context: Optional ssl.SSLContext for HTTPS.
@@ -1135,6 +1138,7 @@ class Dispatcher:
         self._pools = pools or []
         self._static_routes = {}
         self._static_headers = {}
+        self._static_authoritative = {}
         if static_routes:
             for prefix, value in static_routes.items():
                 if isinstance(value, dict):
@@ -1143,6 +1147,8 @@ class Dispatcher:
                             f"static_routes[{prefix!r}] dict missing 'path'")
                     path = value['path']
                     self._static_headers[prefix] = value.get('headers')
+                    self._static_authoritative[prefix] = value.get(
+                        'authoritative', False)
                 else:
                     path = value
                 self._static_routes[prefix] = _os.path.abspath(
@@ -1278,29 +1284,67 @@ class Dispatcher:
         """
 
     def _serve_static(self, client):
-        """Try to serve static file. Returns True if served."""
+        """Try to serve static file. Returns True if served.
+
+        An authoritative mount owns its prefix: a missing file or blocked
+        traversal under it returns 404 here (no fall-through to pools).
+        """
         path = client.path
         for prefix, base_path in self._static_routes.items():
-            if path.startswith(prefix):
-                rel_path = path[len(prefix):]
-                file_path = _os.path.normpath(
-                    _os.path.join(base_path, rel_path))
-                # path traversal protection
-                if not (file_path.startswith(base_path + _os.sep)
-                        or file_path == base_path):
-                    continue
-                if _os.path.isdir(file_path):
-                    file_path = _os.path.join(file_path, _DIR_INDEX)
-                if _os.path.isfile(file_path):
-                    cfg_headers = self._static_headers.get(prefix)
-                    # copy: respond_file/_prepare_response mutate the dict
-                    # in place (content-length etc.) — must not pollute our
-                    # stored per-mount config across requests
-                    client.respond_file(
-                        file_path,
-                        headers=dict(cfg_headers) if cfg_headers else None)
-                    return True
+            if not path.startswith(prefix):
+                continue
+            authoritative = self._static_authoritative.get(prefix, False)
+            rel_path = path[len(prefix):]
+            file_path = _os.path.normpath(
+                _os.path.join(base_path, rel_path))
+            # path traversal protection
+            if not (file_path.startswith(base_path + _os.sep)
+                    or file_path == base_path):
+                if authoritative:
+                    return self._serve_static_404(client, file_path)
+                continue
+            if _os.path.isdir(file_path):
+                file_path = _os.path.join(file_path, _DIR_INDEX)
+            if _os.path.isfile(file_path):
+                cfg_headers = self._static_headers.get(prefix)
+                # copy: respond_file/_prepare_response mutate the dict
+                # in place (content-length etc.) — must not pollute our
+                # stored per-mount config across requests
+                client.respond_file(
+                    file_path,
+                    headers=dict(cfg_headers) if cfg_headers else None)
+                self._fire_static_served(client, file_path, 200)
+                return True
+            if authoritative:
+                return self._serve_static_404(client, file_path)
         return False
+
+    def _serve_static_404(self, client, file_path):
+        """Serve 404 for an authoritative mount and fire the hook."""
+        client.respond({'error': 'Not found'}, status=404)
+        self._fire_static_served(client, file_path, 404)
+        return True
+
+    def _fire_static_served(self, client, file_path, status):
+        """Invoke on_static_served, log and swallow exceptions."""
+        try:
+            self.on_static_served(client, file_path, status)
+        except Exception:
+            self.log.error(
+                "on_static_served raised:\n%s", _traceback.format_exc())
+
+    def on_static_served(self, client, file_path, status):
+        """Called after a static mount serves a response.
+
+        Fires on a 200 (file served) and — for an authoritative mount — on a
+        404 (missing file or blocked traversal). Default no-op; override for
+        access logs. Exceptions are logged and swallowed.
+
+        Args:
+            client: The HTTP connection.
+            file_path: Resolved filesystem path that was served or attempted.
+            status: 200 or 404.
+        """
 
     def _handle_sync(self, client):
         """Try sync route handlers. Returns True if handled."""
