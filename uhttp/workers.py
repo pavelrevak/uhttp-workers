@@ -1091,7 +1091,9 @@ class Dispatcher:
             port: Listen port.
             address: Listen address.
             pools: List of WorkerPool instances.
-            static_routes: Dict of URL prefix -> filesystem path.
+            static_routes: Dict of URL prefix -> filesystem path, or
+                -> {'path': ..., 'headers': {...}} to attach per-mount
+                response headers (e.g. Cache-Control).
             shutdown_timeout: Seconds to wait for workers on shutdown.
             max_pending: Max pending requests before rejecting (503).
             ssl_context: Optional ssl.SSLContext for HTTPS.
@@ -1101,8 +1103,17 @@ class Dispatcher:
         self._address = address
         self._pools = pools or []
         self._static_routes = {}
+        self._static_headers = {}
         if static_routes:
-            for prefix, path in static_routes.items():
+            for prefix, value in static_routes.items():
+                if isinstance(value, dict):
+                    if 'path' not in value:
+                        raise ValueError(
+                            f"static_routes[{prefix!r}] dict missing 'path'")
+                    path = value['path']
+                    self._static_headers[prefix] = value.get('headers')
+                else:
+                    path = value
                 self._static_routes[prefix] = _os.path.abspath(
                     _os.path.expanduser(path))
         self._shutdown_timeout = shutdown_timeout
@@ -1234,7 +1245,13 @@ class Dispatcher:
                 if _os.path.isdir(file_path):
                     file_path = _os.path.join(file_path, _DIR_INDEX)
                 if _os.path.isfile(file_path):
-                    client.respond_file(file_path)
+                    cfg_headers = self._static_headers.get(prefix)
+                    # copy: respond_file/_prepare_response mutate the dict
+                    # in place (content-length etc.) — must not pollute our
+                    # stored per-mount config across requests
+                    client.respond_file(
+                        file_path,
+                        headers=dict(cfg_headers) if cfg_headers else None)
                     return True
         return False
 

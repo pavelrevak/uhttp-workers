@@ -45,6 +45,7 @@ class MockClient:
         self.response_headers = None
         self.redirect_url = None
         self.file_path = None
+        self.file_headers = None
 
     def respond(self, data=None, status=200, headers=None, cookies=None):
         self.responded = True
@@ -59,6 +60,10 @@ class MockClient:
     def respond_file(self, path, headers=None):
         self.responded = True
         self.file_path = path
+        self.file_headers = headers
+        # mimic uhttp-server: respond_file mutates the headers dict in place
+        if headers is not None:
+            headers['content-length'] = 123
 
     def response_stream(self, content_type=None, headers=None, cookies=None):
         self.streaming = True
@@ -214,8 +219,14 @@ class TestDispatcherStaticFiles(unittest.TestCase):
         d = Dispatcher.__new__(Dispatcher)
         d._sync_routes = []
         d._static_routes = {}
+        d._static_headers = {}
         if static_routes:
-            for prefix, path in static_routes.items():
+            for prefix, value in static_routes.items():
+                if isinstance(value, dict):
+                    path = value['path']
+                    d._static_headers[prefix] = value.get('headers')
+                else:
+                    path = value
                 d._static_routes[prefix] = os.path.abspath(path)
         d._pools = pools or []
         d._pending = {}
@@ -252,6 +263,73 @@ class TestDispatcherStaticFiles(unittest.TestCase):
             # traversal blocked, falls through to 404
             self.assertTrue(client.responded)
             self.assertEqual(client.response_status, 404)
+
+    def test_str_route_passes_no_headers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, 'a.txt')
+            with open(filepath, 'w') as f:
+                f.write('x')
+            d = self._make_dispatcher({'/static/': tmpdir})
+            client = MockClient('GET', '/static/a.txt')
+            d._http_request(client)
+            self.assertIsNone(client.file_headers)
+
+    def test_dict_route_passes_headers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, 'a.txt')
+            with open(filepath, 'w') as f:
+                f.write('x')
+            d = self._make_dispatcher(
+                {'/assets/': {
+                    'path': tmpdir,
+                    'headers': {'Cache-Control': 'immutable'}}})
+            client = MockClient('GET', '/assets/a.txt')
+            d._http_request(client)
+            self.assertTrue(client.responded)
+            self.assertEqual(client.file_path, filepath)
+            self.assertEqual(
+                client.file_headers.get('Cache-Control'), 'immutable')
+
+    def test_configured_headers_not_polluted(self):
+        # respond_file mutates the headers dict (content-length etc.);
+        # the stored per-mount config must survive repeated serves intact
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, 'a.txt')
+            with open(filepath, 'w') as f:
+                f.write('x')
+            headers = {'Cache-Control': 'immutable'}
+            d = self._make_dispatcher(
+                {'/assets/': {'path': tmpdir, 'headers': headers}})
+            for _ in range(2):
+                d._http_request(MockClient('GET', '/assets/a.txt'))
+            self.assertEqual(headers, {'Cache-Control': 'immutable'})
+            self.assertNotIn('content-length', headers)
+
+    def test_dict_route_traversal_blocked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = self._make_dispatcher(
+                {'/assets/': {
+                    'path': tmpdir, 'headers': {'X-Test': '1'}}})
+            client = MockClient('GET', '/assets/../../../etc/passwd')
+            d._http_request(client)
+            self.assertTrue(client.responded)
+            self.assertEqual(client.response_status, 404)
+
+    def test_init_dict_missing_path_raises(self):
+        with self.assertRaises(ValueError):
+            Dispatcher(static_routes={'/x/': {'headers': {}}})
+
+    def test_init_dict_extracts_headers(self):
+        h = {'Cache-Control': 'immutable'}
+        d = Dispatcher(
+            static_routes={'/a/': {'path': '/tmp', 'headers': h}})
+        self.assertEqual(d._static_headers['/a/'], h)
+        self.assertEqual(d._static_routes['/a/'], os.path.abspath('/tmp'))
+
+    def test_init_str_route_no_headers_entry(self):
+        d = Dispatcher(static_routes={'/s/': '/tmp'})
+        self.assertNotIn('/s/', d._static_headers)
+        self.assertEqual(d._static_routes['/s/'], os.path.abspath('/tmp'))
 
 
 class TestDispatcherPoolRouting(unittest.TestCase):
@@ -527,6 +605,7 @@ class TestDispatcherRoutePriority(unittest.TestCase):
             d = TestDispatcher.__new__(TestDispatcher)
             d._sync_routes = []
             d._static_routes = {'/static/': os.path.abspath(tmpdir)}
+            d._static_headers = {}
             d._pools = []
             d._pending = {}
             d._max_pending = 1000
