@@ -29,6 +29,7 @@ MSG_SSE_OPEN = 'SSE_OPEN'
 MSG_SSE_EVENT = 'SSE_EVENT'
 MSG_SSE_CLOSE = 'SSE_CLOSE'
 MSG_NDJSON = 'NDJSON'
+MSG_FORWARD = 'FORWARD'
 
 # Worker control messages
 CTL_STOP = 'STOP'
@@ -224,18 +225,20 @@ class Request:
             X-Forwarded-For when the connection comes from a trusted
             proxy (uhttp-server's trusted_proxies setting). None if the
             dispatcher could not resolve the address (e.g., in tests).
+        context: App state attached by Dispatcher.on_request_accepted,
+            serialized to the worker. None unless that hook returns a value.
     """
 
     __slots__ = (
         'request_id', 'method', 'path', 'query',
         'data', 'headers', 'content_type', 'path_params',
-        'remote_address',
+        'remote_address', 'context',
         '_cookies', '_response_queue')
 
     def __init__(
             self, request_id, method, path, query=None,
             data=None, headers=None, content_type=None,
-            remote_address=None):
+            remote_address=None, context=None):
         self.request_id = request_id
         self.method = method
         self.path = path
@@ -245,6 +248,7 @@ class Request:
         self.content_type = content_type
         self.path_params = {}
         self.remote_address = remote_address
+        self.context = context
         self._cookies = None
         self._response_queue = None
 
@@ -599,6 +603,21 @@ class Worker(_mp.Process):
         self._response_queue.put(
             (MSG_HEARTBEAT, self.pool_name,
              self.worker_id, self._current_request_id))
+
+    def forward(self, route, data):
+        """Forward data to a sibling pool, fire-and-forget.
+
+        The dispatcher routes it (via Dispatcher.on_forward) to the pool
+        matching `route` as a request_id=-1 Request — no pending, no
+        response is awaited. Use to hand off work to another pool (e.g.
+        a recognition worker forwarding its raw result to storage) without
+        the dispatcher sitting in the data path. `data` must be picklable.
+
+        Args:
+            route: URL path used to select the target pool.
+            data: Picklable payload delivered as the Request body.
+        """
+        self._response_queue.put((MSG_FORWARD, route, data))
 
     def on_idle(self):
         """Called on each heartbeat interval when no request arrived.
@@ -1283,6 +1302,35 @@ class Dispatcher:
             client: HttpConnection from uhttp-server.
         """
 
+    def on_request_accepted(self, request_id, client, pool):
+        """Attach app state to a request just before it is dispatched.
+
+        The return value is set on the outbound Request.context (serialized
+        to the worker — must be picklable). Use to pass dispatcher-only
+        state to the worker (e.g. an auth role known only here).
+
+        Pure state-attach — must NOT reject (that is do_check/do_check_sync,
+        which run earlier). Exceptions are logged and swallowed, leaving
+        context=None. Default returns None.
+
+        Args:
+            request_id: Internal id paired with the worker response.
+            client: HttpConnection from uhttp-server.
+            pool: The WorkerPool the request is being dispatched to.
+        """
+        return None
+
+    def _fire_request_accepted(self, request_id, client, pool):
+        """Invoke on_request_accepted, log and swallow exceptions."""
+        try:
+            return self.on_request_accepted(request_id, client, pool)
+        except Exception:
+            self.on_log(
+                pool.name, LOG_ERROR,
+                f"on_request_accepted raised for request {request_id}:\n"
+                f"{_traceback.format_exc()}")
+            return None
+
     def _serve_static(self, client):
         """Try to serve static file. Returns True if served.
 
@@ -1390,6 +1438,7 @@ class Dispatcher:
         request_id = self._next_request_id
         self._next_request_id += 1
         self._pending[request_id] = _PendingRequest(client, pool)
+        context = self._fire_request_accepted(request_id, client, pool)
         pool.request_queue.put(Request(
             request_id=request_id,
             method=client.method,
@@ -1398,7 +1447,8 @@ class Dispatcher:
             data=client.data,
             headers=dict(client.headers),
             content_type=client.content_type,
-            remote_address=client.remote_address))
+            remote_address=client.remote_address,
+            context=context))
 
     def _http_request(self, client):
         """Process incoming HTTP request."""
@@ -1482,6 +1532,49 @@ class Dispatcher:
                 self.on_response(response, pending)
                 self._notify_pending_removed(
                     request_id, pending, PENDING_COMPLETED)
+        elif msg_type == MSG_FORWARD:
+            _, route, data = msg
+            self._fire_forward(route, data)
+
+    def _fire_forward(self, route, data):
+        """Invoke on_forward, log and swallow exceptions.
+
+        Sits on the response drain loop — a buggy override or a closed
+        target queue must not kill the dispatcher (unlike on_response,
+        which is unwrapped; that is a latent bug, not a pattern).
+        """
+        try:
+            self.on_forward(route, data)
+        except Exception:
+            self.on_log(
+                route, LOG_ERROR,
+                f"on_forward({route!r}) raised:\n{_traceback.format_exc()}")
+
+    def on_forward(self, route, data):
+        """Route a worker forward (MSG_FORWARD) to a sibling pool.
+
+        Default: find the pool matching `route` and enqueue a
+        request_id=-1 Request (fire-and-forget — the worker's response is
+        ignored). Drop-on-full so a slow sink cannot backpressure the
+        emitting worker; the drop is logged, never silent. Override to
+        change the drop policy.
+
+        Args:
+            route: URL path selecting the target pool.
+            data: Picklable payload for the Request body.
+        """
+        pool = self._find_pool(route)
+        if pool is None:
+            self.on_log(
+                route, LOG_WARNING, f"forward: no pool for route {route!r}")
+            return
+        try:
+            pool.request_queue.put_nowait(Request(
+                request_id=-1, method='POST', path=route, data=data))
+        except _queue.Full:
+            self.on_log(
+                pool.name, LOG_WARNING,
+                f"forward dropped (queue full): {route!r}")
 
     def _stream_disconnected(self, request_id, pending):
         """Handle client disconnect during streaming."""

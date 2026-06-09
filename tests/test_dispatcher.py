@@ -3,6 +3,7 @@
 import os
 import time
 import types
+import queue
 import unittest
 import tempfile
 import multiprocessing as mp
@@ -10,7 +11,7 @@ import multiprocessing as mp
 from uhttp.workers import (
     Dispatcher, Worker, WorkerPool, Request, Response,
     api, sync, RejectRequest,
-    MSG_RESPONSE, MSG_HEARTBEAT,
+    MSG_RESPONSE, MSG_HEARTBEAT, MSG_FORWARD,
     MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE, MSG_NDJSON,
     CTL_DISCONNECT,
     PENDING_COMPLETED, PENDING_TIMEOUT, PENDING_DISCONNECTED,
@@ -703,6 +704,110 @@ class TestDispatcherDegradedLogging(unittest.TestCase):
     def test_no_log_when_stable(self):
         self.assertEqual(self._run(False, False), [])
         self.assertEqual(self._run(True, True), [])
+
+
+class TestDispatcherForward(unittest.TestCase):
+    """MSG_FORWARD handling and default on_forward routing."""
+
+    def test_msg_forward_invokes_on_forward(self):
+        d = Dispatcher.__new__(Dispatcher)
+        d._pools = []
+        calls = []
+        d.on_forward = lambda route, data: calls.append((route, data))
+        d._process_response((MSG_FORWARD, '/x', {'a': 1}))
+        self.assertEqual(calls, [('/x', {'a': 1})])
+
+    def test_default_on_forward_enqueues_request(self):
+        pool = WorkerPool(DummyWorker, routes=['/_internal/**'])
+        d = Dispatcher.__new__(Dispatcher)
+        d._pools = [pool]
+        d.on_forward('/_internal/store', {'id': 7})
+        req = pool.request_queue.get(timeout=2)
+        self.assertEqual(
+            (req.request_id, req.method, req.path, req.data),
+            (-1, 'POST', '/_internal/store', {'id': 7}))
+
+    def test_forward_no_pool_logs_warning(self):
+        d = Dispatcher.__new__(Dispatcher)
+        d._pools = []
+        logs = []
+        d.on_log = lambda name, level, msg: logs.append((level, msg))
+        d.on_forward('/nowhere', {})
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0][0], LOG_WARNING)
+
+    def test_forward_drop_on_full_logs_warning(self):
+        pool = WorkerPool(DummyWorker, routes=['/_internal/**'])
+
+        def _full(item):
+            raise queue.Full
+
+        pool.request_queue = types.SimpleNamespace(put_nowait=_full)
+        d = Dispatcher.__new__(Dispatcher)
+        d._pools = [pool]
+        logs = []
+        d.on_log = lambda name, level, msg: logs.append((level, msg))
+        d.on_forward('/_internal/store', {'id': 7})
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0][0], LOG_WARNING)
+
+    def test_fire_forward_swallows_override_exception(self):
+        d = Dispatcher.__new__(Dispatcher)
+        logs = []
+        d.on_log = lambda name, level, msg: logs.append((level, msg))
+
+        def boom(route, data):
+            raise RuntimeError('hook bug')
+
+        d.on_forward = boom
+        d._fire_forward('/x', {})  # must not raise
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0][0], LOG_ERROR)
+
+
+class TestDispatcherRequestAccepted(unittest.TestCase):
+    """on_request_accepted attaches context to the outbound Request."""
+
+    def _stub_pool(self):
+        return types.SimpleNamespace(
+            name='stub', routes=None, is_degraded=False,
+            alive_count=1, request_queue=mp.Queue())
+
+    def _make_dispatcher(self, pool):
+        d = Dispatcher.__new__(Dispatcher)
+        d._pools = [pool]
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+        return d
+
+    def test_context_attached_to_request(self):
+        pool = self._stub_pool()
+        d = self._make_dispatcher(pool)
+        d.on_request_accepted = lambda rid, client, p: {'role': 'admin'}
+        d._dispatch_to_pool(MockClient('GET', '/x'))
+        req = pool.request_queue.get(timeout=2)
+        self.assertEqual(req.context, {'role': 'admin'})
+
+    def test_default_context_none(self):
+        pool = self._stub_pool()
+        d = self._make_dispatcher(pool)
+        d._dispatch_to_pool(MockClient('GET', '/x'))
+        req = pool.request_queue.get(timeout=2)
+        self.assertIsNone(req.context)
+
+    def test_exception_yields_none_context(self):
+        pool = self._stub_pool()
+        d = self._make_dispatcher(pool)
+        d.on_log = lambda *a: None
+
+        def boom(rid, client, p):
+            raise RuntimeError('hook bug')
+
+        d.on_request_accepted = boom
+        d._dispatch_to_pool(MockClient('GET', '/x'))
+        req = pool.request_queue.get(timeout=2)
+        self.assertIsNone(req.context)
 
 
 class TestDispatcherRoutePriority(unittest.TestCase):

@@ -10,7 +10,7 @@ from unittest import mock
 from uhttp.workers import (
     Worker, Request, Response, api, RejectRequest, DEFERRED,
     Logger, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR,
-    MSG_RESPONSE, MSG_HEARTBEAT,
+    MSG_RESPONSE, MSG_HEARTBEAT, MSG_FORWARD,
     MSG_SSE_OPEN, MSG_SSE_EVENT, MSG_SSE_CLOSE, MSG_NDJSON,
     CTL_DISCONNECT)
 
@@ -808,6 +808,20 @@ class TestWorkerMemoryLimit(unittest.TestCase):
             res.setrlimit.side_effect = ValueError('bad limit')
             worker._apply_memory_limit()  # must not raise
         self.assertEqual(len(warnings), 1)
+
+
+class TestWorkerForward(unittest.TestCase):
+    """Worker.forward puts MSG_FORWARD on the response queue."""
+
+    def test_forward_puts_message(self):
+        request_queue = mp.Queue()
+        control_queue = mp.Queue()
+        response_queue = mp.Queue()
+        worker = SimpleWorker(
+            0, request_queue, control_queue, response_queue)
+        worker.forward('/_internal/store', {'id': 7})
+        msg = response_queue.get(timeout=2)
+        self.assertEqual(msg, (MSG_FORWARD, '/_internal/store', {'id': 7}))
 
 
 class TestWorkerLogName(unittest.TestCase):

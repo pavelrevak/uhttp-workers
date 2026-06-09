@@ -568,6 +568,57 @@ Requests with `request_id=-1` are ignored by the dispatcher when the worker resp
 cleanup that must run regardless of outcome — timeouts, client disconnects, shutdown — use
 `on_pending_removed()` (see below).
 
+## Forwarding to a Sibling Pool
+
+When the producer of the data is the worker itself (not the dispatcher), forward straight
+from the handler with `self.forward(route, data)` instead of post-processing in the
+dispatcher. The worker returns its client-facing response normally **and** hands off a
+separate payload to another pool — the dispatcher stays out of the data path:
+
+```python
+class RecognizeWorker(_workers.Worker):
+    @_workers.api('/recognize', 'POST')
+    def recognize(self, request):
+        result = run_recognition(request.data)
+        # hand the raw result + image off to the storage pool
+        self.forward('/_internal/store', {
+            'image': request.data,
+            'result': result,
+        })
+        return {'plate': result['plate']}   # narrow public response to client
+```
+
+`forward()` is fire-and-forget: the dispatcher routes it (via `on_forward()`) to the pool
+matching `route` as a `request_id=-1` Request, and that worker's response is ignored. The
+target pool must be registered **before** any catch-all `routes=['/']` pool, since the
+first prefix match wins.
+
+Override `on_forward(route, data)` to change the routing or drop policy. The default routes
+to the matching pool with **drop-on-full** (a slow sink can't backpressure the emitting
+worker) and logs a warning on drop — never a silent loss.
+
+### Per-Request Context
+
+Override `on_request_accepted(request_id, client, pool)` to attach dispatcher-only state to
+a request just before it is dispatched — the return value is serialized onto
+`request.context` for the worker to read. Use for state the worker can't derive itself
+(e.g. an auth role resolved during `do_check`):
+
+```python
+class MyDispatcher(_workers.Dispatcher):
+    def on_request_accepted(self, request_id, client, pool):
+        return {'role': getattr(client, '_auth_role', None)}
+
+class MyWorker(_workers.Worker):
+    @_workers.api('/thing', 'GET')
+    def thing(self, request):
+        if request.context.get('role') == 'admin':
+            ...
+```
+
+It is pure state-attach — it must **not** reject (that is `do_check`). Exceptions are logged
+and swallowed, leaving `request.context` as `None`. The value must be picklable.
+
 ## Request Lifecycle Hook
 
 Override `on_pending_removed(request_id, pending, reason)` on the dispatcher when you keep
