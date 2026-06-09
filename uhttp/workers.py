@@ -879,7 +879,8 @@ class WorkerPool:
             timeout=30, stuck_timeout=60, heartbeat_interval=1,
             log_level=LOG_WARNING, max_restarts=10,
             restart_window=300, queue_warning=100,
-            recovery_interval=None, **kwargs):
+            recovery_interval=None, permanent_failure_exitcode=None,
+            **kwargs):
         """Initialize worker pool.
 
         Args:
@@ -899,6 +900,10 @@ class WorkerPool:
                 the pool auto-recovers (clears degraded, resets restart
                 counter, gives workers a fresh chance). None = sticky
                 degraded (default, never auto-recovers).
+            permanent_failure_exitcode: Exit code marking an unrecoverable
+                worker (missing license, bad config, ...). A worker that
+                dies with this code is parked — not restarted, not counted
+                toward max_restarts. None (default) disables parking.
             **kwargs: Extra arguments passed to worker constructor.
         """
         self.worker_class = worker_class
@@ -912,6 +917,7 @@ class WorkerPool:
         self.restart_window = restart_window
         self.queue_warning = queue_warning
         self._recovery_interval = recovery_interval
+        self._permanent_failure_exitcode = permanent_failure_exitcode
         self.kwargs = kwargs
         self.name = worker_class.__name__
         self.request_queue = _mp.Queue()
@@ -922,6 +928,7 @@ class WorkerPool:
         self._restart_times = []
         self._degraded = False
         self._degraded_since = None
+        self._parked = set()
         self._response_queue = None
 
     def start(self, response_queue):
@@ -965,8 +972,10 @@ class WorkerPool:
         """Check worker health, restart dead or stuck workers.
 
         Returns:
-            List of (worker_id, reason, exitcode) tuples for restarted
-            workers. exitcode is None for stuck workers (dispatcher killed
+            List of (worker_id, reason, exitcode) tuples for workers that
+            died this cycle — restarted ones and parked ones (reason
+            'parked exit=N'). Lets the dispatcher fail their victims either
+            way. exitcode is None for stuck workers (dispatcher killed
             them), otherwise the process exit code (negative = signal:
             -9 OOM, -11 SIGSEGV, -15 SIGTERM, etc.).
         """
@@ -977,14 +986,18 @@ class WorkerPool:
             t for t in self._restart_times
             if now - t < self.restart_window]
         # auto-recover from degraded after recovery_interval elapses
+        # (skip when every slot is parked — nothing left to retry)
         if (self._degraded and self._recovery_interval
                 and self._degraded_since is not None
-                and now - self._degraded_since >= self._recovery_interval):
-            # TODO: skip when all slots parked (parking task) — nothing to retry
+                and now - self._degraded_since >= self._recovery_interval
+                and not (self._parked
+                         and len(self._parked) >= self.num_workers)):
             self._degraded = False
             self._degraded_since = None
             self._restart_times = []
         for i, worker in enumerate(self.workers):
+            if i in self._parked:
+                continue
             reason = None
             exitcode = None
             if not worker.is_alive():
@@ -993,19 +1006,35 @@ class WorkerPool:
             elif now - self._last_seen.get(i, 0) > self.stuck_timeout:
                 reason = "stuck"
                 worker.kill()
-            if reason:
+            if not reason:
+                continue
+            # permanent failure → park the slot: no restart, no close()
+            # (close() would make is_alive() raise in alive_count/status/
+            # shutdown — join leaves it safely reporting not-alive)
+            if (self._permanent_failure_exitcode is not None
+                    and exitcode == self._permanent_failure_exitcode):
                 try:
                     worker.join(timeout=1)
-                    worker.close()
                 except Exception:
                     pass
-                self._restart_times.append(now)
-                if len(self._restart_times) >= self.max_restarts:
-                    if not self._degraded:
-                        self._degraded_since = now
-                    self._degraded = True
-                self._start_worker(i)
-                restarted.append((i, reason, exitcode))
+                self._parked.add(i)
+                restarted.append((i, f"parked exit={exitcode}", exitcode))
+                continue
+            try:
+                worker.join(timeout=1)
+                worker.close()
+            except Exception:
+                pass
+            self._restart_times.append(now)
+            if len(self._restart_times) >= self.max_restarts:
+                if not self._degraded:
+                    self._degraded_since = now
+                self._degraded = True
+            self._start_worker(i)
+            restarted.append((i, reason, exitcode))
+        # every slot parked → degraded permanently (recovery is skipped above)
+        if self._parked and len(self._parked) >= self.num_workers:
+            self._degraded = True
         return restarted
 
     def matches(self, path):
@@ -1066,8 +1095,15 @@ class WorkerPool:
 
     @property
     def alive_count(self):
-        """Number of worker processes currently alive."""
-        return sum(1 for w in self.workers if w.is_alive())
+        """Number of worker processes currently alive (parked excluded)."""
+        return sum(
+            1 for i, w in enumerate(self.workers)
+            if i not in self._parked and w.is_alive())
+
+    @property
+    def parked_count(self):
+        """Number of slots parked after a permanent failure."""
+        return len(self._parked)
 
     @property
     def pending_count(self):
@@ -1087,11 +1123,13 @@ class WorkerPool:
             'name': self.name,
             'degraded': self._degraded,
             'alive_count': self.alive_count,
+            'parked_count': self.parked_count,
             'queue_size': self.pending_count,
             'workers': [
                 {
                     'id': i,
                     'alive': w.is_alive(),
+                    'parked': i in self._parked,
                     'last_seen': round(now - self._last_seen.get(i, 0), 1),
                     'current_request': self._current_request.get(i),
                 }
@@ -1699,8 +1737,9 @@ class Dispatcher:
 
         Args:
             pool: WorkerPool the worker belonged to.
-            worker_id: Index of the restarted worker.
-            reason: 'stuck' or 'died exit=N' (string from check_workers).
+            worker_id: Index of the dead worker.
+            reason: 'stuck', 'died exit=N', or 'parked exit=N' (parked slots
+                are not restarted; victims are still failed). From check_workers.
             exitcode: Process exit code (int) or None for stuck workers.
                 Negative values are signals: -9 OOM, -11 SIGSEGV, etc.
             victims: List of (request_id, _PendingRequest) tuples — requests
@@ -1709,7 +1748,7 @@ class Dispatcher:
         """
         self.on_log(
             f'{pool.name}[{worker_id}]', LOG_ERROR,
-            f"worker restarted: {reason}, "
+            f"worker down: {reason}, "
             f"victims={len(victims)}")
         for request_id, pending in victims:
             c = pending.client

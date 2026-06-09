@@ -705,6 +705,25 @@ chance. Useful for transient failures that resolve on their own. The dispatcher 
 a `WARNING` when a pool enters degraded and an
 `INFO` when it recovers.
 
+### Permanent-Failure Parking
+
+Some failures are not transient — a missing license/dongle, bad config, or an
+incompatible SDK makes a worker die the same way on every restart, burning the
+`max_restarts` budget for nothing. Pass `permanent_failure_exitcode=<code>` and have the
+worker `exit(code)` on such a fault:
+
+```python
+WorkerPool(MyWorker, num_workers=4, permanent_failure_exitcode=42)
+```
+
+A worker that dies with that exact code is **parked**: the slot is not restarted and does
+not count toward `max_restarts`. Parked slots drop out of `pool.alive_count` and are
+flagged in `pool.status()` (`parked` per worker, `parked_count` on the pool). Any requests
+the worker had in flight are still failed with 500 via `on_worker_died` (reason
+`parked exit=N`). When **every** slot is parked the pool goes `degraded` — clients get a
+chronic **503** (no `Retry-After`, since retrying won't help), and `recovery_interval` will
+not clear it (there is nothing left to retry). Default `None` disables parking entirely.
+
 ## Dispatcher Idle Hook
 
 Override `on_idle()` on the dispatcher for periodic background tasks — called on each `select()` timeout (every `SELECT_TIMEOUT` seconds, default 1s):
@@ -862,6 +881,7 @@ Errors are logged automatically:
 | `restart_window` | 300 | Time window for restart counting (seconds) |
 | `queue_warning` | 100 | Log warning when queue size exceeds this (0 = disable) |
 | `recovery_interval` | None | Seconds before auto-recovering from degraded (None = sticky) |
+| `permanent_failure_exitcode` | None | Exit code that parks a slot instead of restarting (None = disabled) |
 
 Extra `**kwargs` on `WorkerPool` are passed to worker constructor (accessible as `self.kwargs`).
 

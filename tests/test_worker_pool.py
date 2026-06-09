@@ -13,6 +13,50 @@ class DummyWorker(Worker):
         return {'ok': True}
 
 
+class _DeadWorker:
+    """Stub for a worker process that exited with a given code.
+
+    Models mp.Process: after close() is called, is_alive() raises — so a
+    test that closes a parked slot would surface the landmine.
+    """
+
+    def __init__(self, exitcode):
+        self.exitcode = exitcode
+        self.closed = False
+
+    def is_alive(self):
+        if self.closed:
+            raise ValueError("process object is closed")
+        return False
+
+    def join(self, timeout=None):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def kill(self):
+        pass
+
+
+class _AliveWorker:
+    """Stub for a running worker process."""
+
+    exitcode = None
+
+    def is_alive(self):
+        return True
+
+    def join(self, timeout=None):
+        pass
+
+    def close(self):
+        pass
+
+    def kill(self):
+        pass
+
+
 class TestWorkerPoolMatches(unittest.TestCase):
 
     def test_glob_match(self):
@@ -251,6 +295,96 @@ class TestWorkerPoolRecovery(unittest.TestCase):
         self.assertEqual(pool.recovery_interval, 42)
         pool2 = WorkerPool(DummyWorker)
         self.assertIsNone(pool2.recovery_interval)
+
+
+class TestWorkerPoolParking(unittest.TestCase):
+    """Permanent-failure parking via permanent_failure_exitcode."""
+
+    def _pool(self, num_workers=1, **kw):
+        pool = WorkerPool(DummyWorker, num_workers=num_workers, **kw)
+        pool._last_seen = {i: time.time() for i in range(num_workers)}
+        pool._current_request = {i: None for i in range(num_workers)}
+        pool._start_worker = lambda i: self._spawned.append(i)
+        self._spawned = []
+        return pool
+
+    def test_parks_matching_exitcode(self):
+        pool = self._pool(permanent_failure_exitcode=42)
+        pool.workers = [_DeadWorker(42)]
+        result = pool.check_workers()
+        self.assertIn(0, pool._parked)
+        self.assertEqual(self._spawned, [])          # not restarted
+        self.assertEqual(pool._restart_times, [])    # not counted
+        self.assertEqual(result, [(0, 'parked exit=42', 42)])
+
+    def test_restarts_other_exitcode(self):
+        pool = self._pool(permanent_failure_exitcode=42)
+        pool.workers = [_DeadWorker(-9)]   # OOM kill — not permanent
+        pool.check_workers()
+        self.assertNotIn(0, pool._parked)
+        self.assertEqual(self._spawned, [0])
+        self.assertEqual(len(pool._restart_times), 1)
+
+    def test_disabled_never_parks(self):
+        pool = self._pool()  # permanent_failure_exitcode=None
+        pool.workers = [_DeadWorker(42)]
+        pool.check_workers()
+        self.assertEqual(pool._parked, set())
+        self.assertEqual(self._spawned, [0])
+
+    def test_skips_already_parked_slot(self):
+        pool = self._pool(permanent_failure_exitcode=42)
+        pool.workers = [_DeadWorker(42)]
+        pool._parked = {0}
+        result = pool.check_workers()
+        self.assertEqual(result, [])
+        self.assertEqual(self._spawned, [])
+
+    def test_parked_slot_not_closed(self):
+        # the landmine guard: parking must join() but not close(), else
+        # is_alive() raises later in alive_count/status/shutdown
+        pool = self._pool(permanent_failure_exitcode=42)
+        worker = _DeadWorker(42)
+        pool.workers = [worker]
+        pool.check_workers()
+        self.assertFalse(worker.closed)
+        # none of these raise (would if the slot had been closed)
+        self.assertEqual(pool.alive_count, 0)
+        pool.status()
+        pool._control_queues = []
+        pool.shutdown(timeout=0)
+
+    def test_alive_count_excludes_parked(self):
+        pool = self._pool(num_workers=2, permanent_failure_exitcode=42)
+        pool.workers = [_DeadWorker(42), _AliveWorker()]
+        pool._parked = {0}
+        self.assertEqual(pool.alive_count, 1)
+
+    def test_status_marks_parked(self):
+        pool = self._pool(num_workers=2, permanent_failure_exitcode=42)
+        pool.workers = [_DeadWorker(42), _AliveWorker()]
+        pool._parked = {0}
+        st = pool.status()
+        self.assertEqual(st['parked_count'], 1)
+        self.assertTrue(st['workers'][0]['parked'])
+        self.assertFalse(st['workers'][1]['parked'])
+
+    def test_all_parked_sets_degraded(self):
+        pool = self._pool(permanent_failure_exitcode=42)
+        pool.workers = [_DeadWorker(42)]
+        pool.check_workers()
+        self.assertTrue(pool.is_degraded)
+
+    def test_recovery_skipped_when_all_parked(self):
+        pool = self._pool(
+            permanent_failure_exitcode=42, recovery_interval=1)
+        pool.workers = [_DeadWorker(42)]
+        pool._parked = {0}
+        pool._degraded = True
+        pool._degraded_since = time.time() - 5   # elapsed
+        pool._restart_times = [time.time()]
+        pool.check_workers()
+        self.assertTrue(pool.is_degraded)   # not recovered — nothing to retry
 
 
 if __name__ == '__main__':
