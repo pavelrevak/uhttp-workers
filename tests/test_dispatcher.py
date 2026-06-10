@@ -182,6 +182,28 @@ class TestDispatcherDoCheckSync(unittest.TestCase):
         self.assertEqual(calls, ['/health'])
         self.assertEqual(client.response_data, {'status': 'ok'})
 
+    def test_sync_handler_exception_yields_500(self):
+        # a non-RejectRequest exception in a sync handler must not escape
+        # _http_request — it becomes a logged 500
+        class TestDispatcher(Dispatcher):
+            @sync('/boom')
+            def boom(self, client, path_params):
+                raise RuntimeError('handler bug')
+
+        d = TestDispatcher.__new__(TestDispatcher)
+        d._sync_routes = []
+        d._static_routes = {}
+        d._pools = []
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+        d.on_log = lambda *a: None
+        d._build_sync_routes()
+
+        client = MockClient('GET', '/boom')
+        d._http_request(client)   # must not raise
+        self.assertEqual(client.response_status, 500)
+
 
 class TestDispatcherSyncRoutes(unittest.TestCase):
 

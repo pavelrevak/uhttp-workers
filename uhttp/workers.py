@@ -1508,23 +1508,32 @@ class Dispatcher:
             context=context))
 
     def _http_request(self, client):
-        """Process incoming HTTP request."""
-        # 1. static files
-        if self._serve_static(client):
-            return
-        # 2. sync handlers
-        if self._handle_sync(client):
-            return
-        # 3. auth/validation check
+        """Process incoming HTTP request: static -> sync -> do_check -> pool.
+
+        RejectRequest (from do_check or a handler that already responded)
+        stops processing cleanly. Any other exception — in a static mount,
+        sync handler, do_check_sync, do_check, or dispatch — is logged and
+        turned into a 500 so a buggy hook/handler can't break the event loop.
+        """
         try:
+            if self._serve_static(client):
+                return
+            if self._handle_sync(client):
+                return
             self.do_check(client)
+            self._dispatch_to_pool(client)
         except RejectRequest:
             return
         except Exception:
-            client.respond({'error': 'Internal server error'}, status=500)
-            return
-        # 4. dispatch to worker pool
-        self._dispatch_to_pool(client)
+            self.on_log(
+                type(self).__name__, LOG_ERROR,
+                f"request handling failed:\n{_traceback.format_exc()}")
+            # response may already be started — guard the fallback
+            try:
+                client.respond(
+                    {'error': 'Internal server error'}, status=500)
+            except Exception:
+                pass
 
     def _process_response(self, msg):
         """Process a single message from response queue."""
