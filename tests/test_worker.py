@@ -255,7 +255,7 @@ class TestWorkerProcessControl(unittest.TestCase):
         response_queue = mp.Queue()
         control_queue.put(None)
         worker = SimpleWorker(0, request_queue, control_queue, response_queue)
-        worker.heartbeat_interval = 0.1
+        worker._heartbeat_interval = 0.1
         worker.start()
         worker.join(timeout=5)
         self.assertFalse(worker.is_alive())
@@ -268,7 +268,7 @@ class TestWorkerProcessControl(unittest.TestCase):
         control_queue.put(('CONFIG', {'key': 'value'}))
         control_queue.put(None)  # stop after config
         worker = ConfigWorker(0, request_queue, control_queue, response_queue)
-        worker.heartbeat_interval = 0.1
+        worker._heartbeat_interval = 0.1
         worker.start()
         worker.join(timeout=5)
         self.assertFalse(worker.is_alive())
@@ -288,7 +288,7 @@ class TestWorkerRunLoop(unittest.TestCase):
         response_queue = mp.Queue()
         worker = SimpleWorker(
             0, request_queue, control_queue, response_queue)
-        worker.heartbeat_interval = 0.1
+        worker._heartbeat_interval = 0.1
         # put request — control stop will be sent after we see response
         request_queue.put(Request(1, 'GET', '/items'))
         worker.start()
@@ -318,7 +318,7 @@ class TestWorkerRunLoop(unittest.TestCase):
         response_queue = mp.Queue()
         worker = SimpleWorker(
             0, request_queue, control_queue, response_queue)
-        worker.heartbeat_interval = 0.1
+        worker._heartbeat_interval = 0.1
         worker.start()
         # wait for at least one heartbeat
         msg = response_queue.get(timeout=3)
@@ -336,7 +336,7 @@ class TestWorkerRunLoop(unittest.TestCase):
         response_queue = mp.Queue()
         worker = SetupWorker(
             0, request_queue, control_queue, response_queue)
-        worker.heartbeat_interval = 0.1
+        worker._heartbeat_interval = 0.1
         worker.start()
         # wait for setup signal
         msg = response_queue.get(timeout=5)
@@ -392,7 +392,7 @@ class TestDeferredResponse(unittest.TestCase):
         response_queue = mp.Queue()
         worker = DeferredWorker(
             0, request_queue, control_queue, response_queue)
-        worker.heartbeat_interval = 0.1
+        worker._heartbeat_interval = 0.1
         request_queue.put(Request(1, 'POST', '/defer'))
         worker.start()
         # collect messages — should get heartbeat but no MSG_RESPONSE
@@ -591,7 +591,7 @@ class TestSSEWorkerDisconnect(unittest.TestCase):
         control_queue.put(None)  # stop
         worker = TrackingDisconnectWorker(
             0, request_queue, control_queue, response_queue)
-        worker.heartbeat_interval = 0.1
+        worker._heartbeat_interval = 0.1
         worker.start()
         worker.join(timeout=5)
         self.assertFalse(worker.is_alive())
@@ -687,7 +687,7 @@ class TestWorkerTeardown(unittest.TestCase):
         control_queue.put(None)  # immediate stop
         worker = TeardownWorker(
             0, request_queue, control_queue, response_queue)
-        worker.heartbeat_interval = 0.1
+        worker._heartbeat_interval = 0.1
         worker.start()
         worker.join(timeout=5)
         self.assertFalse(worker.is_alive())

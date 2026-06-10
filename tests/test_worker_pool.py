@@ -110,11 +110,11 @@ class TestWorkerPoolStartShutdown(unittest.TestCase):
         pool = WorkerPool(DummyWorker, num_workers=2)
         response_queue = mp.Queue()
         pool.start(response_queue)
-        self.assertEqual(len(pool.workers), 2)
-        for w in pool.workers:
+        self.assertEqual(len(pool._workers), 2)
+        for w in pool._workers:
             self.assertTrue(w.is_alive())
         pool.shutdown(timeout=3)
-        for w in pool.workers:
+        for w in pool._workers:
             self.assertFalse(w.is_alive())
 
     def test_broadcast(self):
@@ -124,7 +124,7 @@ class TestWorkerPoolStartShutdown(unittest.TestCase):
         pool.broadcast(('CONFIG', {'key': 'val'}))
         # workers receive config — just verify they stay alive
         time.sleep(0.2)
-        for w in pool.workers:
+        for w in pool._workers:
             self.assertTrue(w.is_alive())
         pool.shutdown(timeout=3)
 
@@ -134,7 +134,7 @@ class TestWorkerPoolStartShutdown(unittest.TestCase):
         pool.start(response_queue)
         pool.send_config({'debug': True})
         time.sleep(0.2)
-        self.assertTrue(pool.workers[0].is_alive())
+        self.assertTrue(pool._workers[0].is_alive())
         pool.shutdown(timeout=3)
 
 
@@ -193,9 +193,9 @@ class TestWorkerPoolCheckWorkers(unittest.TestCase):
         response_queue = mp.Queue()
         pool.start(response_queue)
         # kill worker
-        pool.workers[0].kill()
-        pool.workers[0].join(timeout=2)
-        self.assertFalse(pool.workers[0].is_alive())
+        pool._workers[0].kill()
+        pool._workers[0].join(timeout=2)
+        self.assertFalse(pool._workers[0].is_alive())
         # check should restart
         restarted = pool.check_workers()
         self.assertEqual(len(restarted), 1)
@@ -203,7 +203,7 @@ class TestWorkerPoolCheckWorkers(unittest.TestCase):
         self.assertIn('died', restarted[0][1])
         # new worker should be alive
         time.sleep(0.2)
-        self.assertTrue(pool.workers[0].is_alive())
+        self.assertTrue(pool._workers[0].is_alive())
         pool.shutdown(timeout=3)
 
     def test_no_restart_healthy(self):
@@ -223,8 +223,8 @@ class TestWorkerPoolCheckWorkers(unittest.TestCase):
         pool.start(response_queue)
         # simulate multiple restarts
         for _ in range(3):
-            pool.workers[0].kill()
-            pool.workers[0].join(timeout=2)
+            pool._workers[0].kill()
+            pool._workers[0].join(timeout=2)
             pool.check_workers()
             time.sleep(0.1)
         self.assertTrue(pool.is_degraded)
@@ -238,8 +238,8 @@ class TestWorkerPoolCheckWorkers(unittest.TestCase):
         response_queue = mp.Queue()
         pool.start(response_queue)
         for _ in range(2):
-            pool.workers[0].kill()
-            pool.workers[0].join(timeout=2)
+            pool._workers[0].kill()
+            pool._workers[0].join(timeout=2)
             pool.check_workers()
             time.sleep(0.1)
         self.assertTrue(pool.is_degraded)
@@ -247,8 +247,8 @@ class TestWorkerPoolCheckWorkers(unittest.TestCase):
         self.assertIsNotNone(first_since)
         # further restarts must not move the timestamp
         for _ in range(2):
-            pool.workers[0].kill()
-            pool.workers[0].join(timeout=2)
+            pool._workers[0].kill()
+            pool._workers[0].join(timeout=2)
             pool.check_workers()
             time.sleep(0.1)
         self.assertEqual(pool._degraded_since, first_since)
@@ -310,7 +310,7 @@ class TestWorkerPoolParking(unittest.TestCase):
 
     def test_parks_matching_exitcode(self):
         pool = self._pool(permanent_failure_exitcode=42)
-        pool.workers = [_DeadWorker(42)]
+        pool._workers = [_DeadWorker(42)]
         result = pool.check_workers()
         self.assertIn(0, pool._parked)
         self.assertEqual(self._spawned, [])          # not restarted
@@ -319,7 +319,7 @@ class TestWorkerPoolParking(unittest.TestCase):
 
     def test_restarts_other_exitcode(self):
         pool = self._pool(permanent_failure_exitcode=42)
-        pool.workers = [_DeadWorker(-9)]   # OOM kill — not permanent
+        pool._workers = [_DeadWorker(-9)]   # OOM kill — not permanent
         pool.check_workers()
         self.assertNotIn(0, pool._parked)
         self.assertEqual(self._spawned, [0])
@@ -327,14 +327,14 @@ class TestWorkerPoolParking(unittest.TestCase):
 
     def test_disabled_never_parks(self):
         pool = self._pool()  # permanent_failure_exitcode=None
-        pool.workers = [_DeadWorker(42)]
+        pool._workers = [_DeadWorker(42)]
         pool.check_workers()
         self.assertEqual(pool._parked, set())
         self.assertEqual(self._spawned, [0])
 
     def test_skips_already_parked_slot(self):
         pool = self._pool(permanent_failure_exitcode=42)
-        pool.workers = [_DeadWorker(42)]
+        pool._workers = [_DeadWorker(42)]
         pool._parked = {0}
         result = pool.check_workers()
         self.assertEqual(result, [])
@@ -345,7 +345,7 @@ class TestWorkerPoolParking(unittest.TestCase):
         # is_alive() raises later in alive_count/status/shutdown
         pool = self._pool(permanent_failure_exitcode=42)
         worker = _DeadWorker(42)
-        pool.workers = [worker]
+        pool._workers = [worker]
         pool.check_workers()
         self.assertFalse(worker.closed)
         # none of these raise (would if the slot had been closed)
@@ -356,13 +356,13 @@ class TestWorkerPoolParking(unittest.TestCase):
 
     def test_alive_count_excludes_parked(self):
         pool = self._pool(num_workers=2, permanent_failure_exitcode=42)
-        pool.workers = [_DeadWorker(42), _AliveWorker()]
+        pool._workers = [_DeadWorker(42), _AliveWorker()]
         pool._parked = {0}
         self.assertEqual(pool.alive_count, 1)
 
     def test_status_marks_parked(self):
         pool = self._pool(num_workers=2, permanent_failure_exitcode=42)
-        pool.workers = [_DeadWorker(42), _AliveWorker()]
+        pool._workers = [_DeadWorker(42), _AliveWorker()]
         pool._parked = {0}
         st = pool.status()
         self.assertEqual(st['parked_count'], 1)
@@ -371,14 +371,14 @@ class TestWorkerPoolParking(unittest.TestCase):
 
     def test_all_parked_sets_degraded(self):
         pool = self._pool(permanent_failure_exitcode=42)
-        pool.workers = [_DeadWorker(42)]
+        pool._workers = [_DeadWorker(42)]
         pool.check_workers()
         self.assertTrue(pool.is_degraded)
 
     def test_recovery_skipped_when_all_parked(self):
         pool = self._pool(
             permanent_failure_exitcode=42, recovery_interval=1)
-        pool.workers = [_DeadWorker(42)]
+        pool._workers = [_DeadWorker(42)]
         pool._parked = {0}
         pool._degraded = True
         pool._degraded_since = time.time() - 5   # elapsed

@@ -454,8 +454,8 @@ class Worker(_mp.Process):
             {pool_name}, {pid}. Default '{cls}[{worker_id}]'; override to
             customize (e.g. 'api-{pool_name}-{worker_id}'). {pid} is the
             worker process PID.
-        worker_id: Unique index of this worker within its pool.
-        heartbeat_interval: Seconds between heartbeats when idle.
+        worker_id: Unique index of this worker within its pool (read-only).
+        pool_name: Name of the owning pool (read-only).
         kwargs: Extra arguments from WorkerPool, accessible in setup().
         log: Logger instance for sending log messages to dispatcher.
     """
@@ -481,9 +481,9 @@ class Worker(_mp.Process):
             **kwargs: Extra arguments accessible via self.kwargs in setup().
         """
         super().__init__(daemon=True)
-        self.worker_id = worker_id
-        self.pool_name = pool_name
-        self.heartbeat_interval = heartbeat_interval
+        self._worker_id = worker_id
+        self._pool_name = pool_name
+        self._heartbeat_interval = heartbeat_interval
         self.kwargs = kwargs
         self._request_queue = request_queue
         self._control_queue = control_queue
@@ -498,6 +498,16 @@ class Worker(_mp.Process):
         self._current_request_id = None
         self._running = True
         self._accepting = True
+
+    @property
+    def worker_id(self):
+        """Index of this worker within its pool (assigned by the pool)."""
+        return self._worker_id
+
+    @property
+    def pool_name(self):
+        """Name of the pool this worker belongs to."""
+        return self._pool_name
 
     def _build_routes(self):
         """Collect @api decorated methods from worker and HANDLERS."""
@@ -601,8 +611,8 @@ class Worker(_mp.Process):
         and stuck worker detection.
         """
         self._response_queue.put(
-            (MSG_HEARTBEAT, self.pool_name,
-             self.worker_id, self._current_request_id))
+            (MSG_HEARTBEAT, self._pool_name,
+             self._worker_id, self._current_request_id))
 
     def forward(self, route, data):
         """Forward data to a sibling pool, fire-and-forget.
@@ -772,8 +782,8 @@ class Worker(_mp.Process):
         """
         ctx = {
             'cls': type(self).__name__,
-            'worker_id': self.worker_id,
-            'pool_name': self.pool_name,
+            'worker_id': self._worker_id,
+            'pool_name': self._pool_name,
             'pid': _os.getpid(),
         }
         try:
@@ -782,7 +792,7 @@ class Worker(_mp.Process):
             self.log.warning(
                 "invalid LOG_NAME %r: %s — using default",
                 self.LOG_NAME, err)
-            return f'{type(self).__name__}[{self.worker_id}]'
+            return f'{type(self).__name__}[{self._worker_id}]'
 
     def run(self):
         """Worker main loop using select for multiplexing."""
@@ -818,7 +828,7 @@ class Worker(_mp.Process):
                 read_fds.append(req_reader)
             write_fds = list(self._writers)
             readable, writable, _ = _select.select(
-                read_fds, write_fds, [], self.heartbeat_interval)
+                read_fds, write_fds, [], self._heartbeat_interval)
             if not self._running:
                 break
             if not readable and not writable:
@@ -826,7 +836,7 @@ class Worker(_mp.Process):
                 if _os.getppid() == 1:
                     break
                 self._response_queue.put(
-                    (MSG_HEARTBEAT, self.pool_name, self.worker_id, None))
+                    (MSG_HEARTBEAT, self._pool_name, self._worker_id, None))
                 self.on_idle()
                 continue
             # control messages
@@ -858,7 +868,7 @@ class Worker(_mp.Process):
                 request._response_queue = self._response_queue
                 self._current_request_id = request.request_id
                 self._response_queue.put(
-                    (MSG_HEARTBEAT, self.pool_name, self.worker_id, request.request_id))
+                    (MSG_HEARTBEAT, self._pool_name, self._worker_id, request.request_id))
                 response = self._handle_request(request)
                 self._current_request_id = None
                 if response is not None:
@@ -906,22 +916,22 @@ class WorkerPool:
                 toward max_restarts. None (default) disables parking.
             **kwargs: Extra arguments passed to worker constructor.
         """
-        self.worker_class = worker_class
-        self.num_workers = num_workers
-        self.routes = routes
-        self.timeout = timeout
-        self.heartbeat_interval = heartbeat_interval
-        self.log_level = log_level
-        self.stuck_timeout = stuck_timeout
-        self.max_restarts = max_restarts
-        self.restart_window = restart_window
-        self.queue_warning = queue_warning
+        self._worker_class = worker_class
+        self._num_workers = num_workers
+        self._routes = routes
+        self._timeout = timeout
+        self._heartbeat_interval = heartbeat_interval
+        self._log_level = log_level
+        self._stuck_timeout = stuck_timeout
+        self._max_restarts = max_restarts
+        self._restart_window = restart_window
+        self._queue_warning = queue_warning
         self._recovery_interval = recovery_interval
         self._permanent_failure_exitcode = permanent_failure_exitcode
-        self.kwargs = kwargs
-        self.name = worker_class.__name__
-        self.request_queue = _mp.Queue()
-        self.workers = []
+        self._kwargs = kwargs
+        self._name = worker_class.__name__
+        self._request_queue = _mp.Queue()
+        self._workers = []
         self._control_queues = []
         self._last_seen = {}
         self._current_request = {}
@@ -938,27 +948,27 @@ class WorkerPool:
             response_queue: Shared response queue for all pools.
         """
         self._response_queue = response_queue
-        for i in range(self.num_workers):
+        for i in range(self._num_workers):
             self._start_worker(i)
 
     def _start_worker(self, index):
         """Start or restart a single worker."""
         control_queue = _mp.Queue()
-        worker = self.worker_class(
+        worker = self._worker_class(
             worker_id=index,
-            request_queue=self.request_queue,
+            request_queue=self._request_queue,
             control_queue=control_queue,
             response_queue=self._response_queue,
-            heartbeat_interval=self.heartbeat_interval,
-            log_level=self.log_level,
-            pool_name=self.name,
-            **self.kwargs)
+            heartbeat_interval=self._heartbeat_interval,
+            log_level=self._log_level,
+            pool_name=self._name,
+            **self._kwargs)
         worker.start()
-        if index < len(self.workers):
-            self.workers[index] = worker
+        if index < len(self._workers):
+            self._workers[index] = worker
             self._control_queues[index] = control_queue
         else:
-            self.workers.append(worker)
+            self._workers.append(worker)
             self._control_queues.append(control_queue)
         self._last_seen[index] = _time.time()
         self._current_request[index] = None
@@ -984,18 +994,18 @@ class WorkerPool:
         # clean old restart times
         self._restart_times = [
             t for t in self._restart_times
-            if now - t < self.restart_window]
+            if now - t < self._restart_window]
         # auto-recover from degraded after recovery_interval elapses
         # (skip when every slot is parked — nothing left to retry)
         if (self._degraded and self._recovery_interval
                 and self._degraded_since is not None
                 and now - self._degraded_since >= self._recovery_interval
                 and not (self._parked
-                         and len(self._parked) >= self.num_workers)):
+                         and len(self._parked) >= self._num_workers)):
             self._degraded = False
             self._degraded_since = None
             self._restart_times = []
-        for i, worker in enumerate(self.workers):
+        for i, worker in enumerate(self._workers):
             if i in self._parked:
                 continue
             reason = None
@@ -1003,7 +1013,7 @@ class WorkerPool:
             if not worker.is_alive():
                 exitcode = worker.exitcode
                 reason = f"died exit={exitcode}"
-            elif now - self._last_seen.get(i, 0) > self.stuck_timeout:
+            elif now - self._last_seen.get(i, 0) > self._stuck_timeout:
                 reason = "stuck"
                 worker.kill()
             if not reason:
@@ -1026,14 +1036,14 @@ class WorkerPool:
             except Exception:
                 pass
             self._restart_times.append(now)
-            if len(self._restart_times) >= self.max_restarts:
+            if len(self._restart_times) >= self._max_restarts:
                 if not self._degraded:
                     self._degraded_since = now
                 self._degraded = True
             self._start_worker(i)
             restarted.append((i, reason, exitcode))
         # every slot parked → degraded permanently (recovery is skipped above)
-        if self._parked and len(self._parked) >= self.num_workers:
+        if self._parked and len(self._parked) >= self._num_workers:
             self._degraded = True
         return restarted
 
@@ -1046,9 +1056,9 @@ class WorkerPool:
         Returns:
             True if path matches, or pool is fallback (routes=None).
         """
-        if self.routes is None:
+        if self._routes is None:
             return True  # default/fallback pool
-        for route in self.routes:
+        for route in self._routes:
             if _match_prefix(route, path):
                 return True
         return False
@@ -1078,12 +1088,37 @@ class WorkerPool:
         """
         self.broadcast(None)
         deadline = _time.time() + timeout
-        for worker in self.workers:
+        for worker in self._workers:
             remaining = max(0, deadline - _time.time())
             worker.join(timeout=remaining)
             if worker.is_alive():
                 worker.kill()
                 worker.join(timeout=1)
+
+    @property
+    def name(self):
+        """Pool name (the worker class name)."""
+        return self._name
+
+    @property
+    def num_workers(self):
+        """Configured number of worker slots."""
+        return self._num_workers
+
+    @property
+    def timeout(self):
+        """Request timeout in seconds (504 on expiry)."""
+        return self._timeout
+
+    @property
+    def kwargs(self):
+        """Extra kwargs passed to each worker constructor."""
+        return self._kwargs
+
+    @property
+    def request_queue(self):
+        """Shared request queue feeding this pool's workers."""
+        return self._request_queue
 
     @property
     def is_degraded(self):
@@ -1097,7 +1132,7 @@ class WorkerPool:
     def alive_count(self):
         """Number of worker processes currently alive (parked excluded)."""
         return sum(
-            1 for i, w in enumerate(self.workers)
+            1 for i, w in enumerate(self._workers)
             if i not in self._parked and w.is_alive())
 
     @property
@@ -1108,7 +1143,7 @@ class WorkerPool:
     @property
     def pending_count(self):
         try:
-            return self.request_queue.qsize()
+            return self._request_queue.qsize()
         except NotImplementedError:
             return 0
 
@@ -1120,7 +1155,7 @@ class WorkerPool:
         """
         now = _time.time()
         return {
-            'name': self.name,
+            'name': self._name,
             'degraded': self._degraded,
             'alive_count': self.alive_count,
             'parked_count': self.parked_count,
@@ -1133,7 +1168,7 @@ class WorkerPool:
                     'last_seen': round(now - self._last_seen.get(i, 0), 1),
                     'current_request': self._current_request.get(i),
                 }
-                for i, w in enumerate(self.workers)
+                for i, w in enumerate(self._workers)
             ],
         }
 
@@ -1466,7 +1501,7 @@ class Dispatcher:
         """Find matching worker pool for path, or fallback pool."""
         default_pool = None
         for pool in self._pools:
-            if pool.routes is None:
+            if pool._routes is None:
                 default_pool = pool
                 continue
             if pool.matches(path):
@@ -1714,13 +1749,13 @@ class Dispatcher:
                         pool.name, LOG_ERROR,
                         f"on_worker_died() failed:\n"
                         f"{_traceback.format_exc()}")
-            if pool.queue_warning:
+            if pool._queue_warning:
                 qsize = pool.pending_count
-                if qsize >= pool.queue_warning:
+                if qsize >= pool._queue_warning:
                     self.on_log(
                         pool.name, LOG_WARNING,
                         f"queue size {qsize} exceeds "
-                        f"threshold {pool.queue_warning}")
+                        f"threshold {pool._queue_warning}")
 
     def on_log(self, name, level, message):
         """Called when a worker sends a log message.

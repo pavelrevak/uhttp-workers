@@ -306,7 +306,7 @@ class TestDispatcherDoCheck(unittest.TestCase):
     def test_pass_check(self):
         pool = WorkerPool(DummyWorker, routes=['/api/**'])
         # fake a live worker so alive_count > 0 without starting processes
-        pool.workers = [type('W', (), {'is_alive': lambda self: True})()]
+        pool._workers = [type('W', (), {'is_alive': lambda self: True})()]
         d = Dispatcher.__new__(Dispatcher)
         d._sync_routes = []
         d._static_routes = {}
@@ -594,7 +594,7 @@ class TestDispatcherPoolRouting(unittest.TestCase):
     def test_dispatch_no_alive_workers_returns_503(self):
         """Transient: pool has workers but none currently alive."""
         # pool has dead workers (not degraded yet)
-        self.pool_default.workers = [
+        self.pool_default._workers = [
             type('W', (), {'is_alive': lambda self: False})()]
         d = Dispatcher.__new__(Dispatcher)
         d._sync_routes = []
@@ -617,7 +617,7 @@ class TestDispatcherPoolRouting(unittest.TestCase):
 
     def test_dispatch_empty_workers_returns_503(self):
         """Pool was never started (empty workers list)."""
-        # self.pool_default.workers is [] from __init__
+        # self.pool_default._workers is [] from __init__
         d = Dispatcher.__new__(Dispatcher)
         d._sync_routes = []
         d._static_routes = {}
@@ -636,7 +636,7 @@ class TestDispatcherPoolRouting(unittest.TestCase):
     def test_dispatch_forwards_remote_address(self):
         """Request enqueued to worker carries client.remote_address."""
         # fake an alive worker so dispatch reaches enqueue
-        self.pool_default.workers = [
+        self.pool_default._workers = [
             type('W', (), {'is_alive': lambda self: True})()]
         d = Dispatcher.__new__(Dispatcher)
         d._sync_routes = []
@@ -684,7 +684,7 @@ class TestDispatcherProcessResponse(unittest.TestCase):
         pool = WorkerPool(DummyWorker, num_workers=2)
         pool._last_seen = {0: 0, 1: 0}
         pool._current_request = {0: None, 1: None}
-        pool.workers = [None, None]  # placeholders
+        pool._workers = [None, None]  # placeholders
         d = Dispatcher.__new__(Dispatcher)
         d._pools = [pool]
         d._pending = {}
@@ -735,7 +735,7 @@ class _FlipPool:
 
     def __init__(self, before, after):
         self.name = 'flip'
-        self.queue_warning = 0
+        self._queue_warning = 0
         self._degraded = before
         self._after = after
 
@@ -815,7 +815,7 @@ class TestDispatcherForward(unittest.TestCase):
         def _full(item):
             raise queue.Full
 
-        pool.request_queue = types.SimpleNamespace(put_nowait=_full)
+        pool._request_queue = types.SimpleNamespace(put_nowait=_full)
         d = Dispatcher.__new__(Dispatcher)
         d._pools = [pool]
         logs = []
@@ -843,7 +843,7 @@ class TestDispatcherRequestAccepted(unittest.TestCase):
 
     def _stub_pool(self):
         return types.SimpleNamespace(
-            name='stub', routes=None, is_degraded=False,
+            name='stub', _routes=None, is_degraded=False,
             alive_count=1, request_queue=mp.Queue())
 
     def _make_dispatcher(self, pool):
