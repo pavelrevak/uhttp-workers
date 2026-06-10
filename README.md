@@ -1,6 +1,6 @@
 # uhttp-workers
 
-Multi-process worker dispatcher built on [uhttp-server](https://github.com/cortexm/uhttp-server).
+Multi-process worker dispatcher built on [uhttp-server](https://github.com/pavelrevak/uhttp-server).
 
 Single dispatcher process handles all connections, N worker processes handle business logic in parallel. Communication via `multiprocessing.Queue` with efficient `select()` integration (POSIX only).
 
@@ -557,6 +557,39 @@ class MyWorker(_workers.Worker):
 
 Default behavior logs the error with traceback and returns 500.
 
+## Dispatcher Hooks
+
+Override these on a `Dispatcher` subclass to extend behavior — each is detailed in its own
+section below. None of them need `super()` except where noted.
+
+| Hook | When it fires | Typical use |
+|------|---------------|-------------|
+| `do_check_sync(client)` | a sync route matched, before its handler | auth/validate sync routes |
+| `do_check(client)` | before dispatching to a worker pool | auth/validate API requests |
+| `on_request_accepted(request_id, client, pool)` | just before the request is queued | attach `request.context` for the worker |
+| `on_response(response, pending)` | after a worker response is sent | post-process / cross-pool work |
+| `on_forward(route, data)` | a worker called `forward()` | route the payload to a sibling pool |
+| `on_static_served(client, file_path, status)` | a static mount served 200 / authoritative 404 | access logging |
+| `on_pending_removed(request_id, pending, reason)` | a request leaves `_pending` (any outcome) | side-state cleanup |
+| `on_worker_died(pool, worker_id, reason, exitcode, victims)` | a worker died/was parked | fail victims, post-mortem (call `super()`) |
+| `on_idle()` | each `select()` timeout with no events | periodic maintenance |
+| `on_log(name, level, message)` | a log message is emitted | customize log output |
+
+Request flow and where each hook sits:
+
+```
+static:   _serve_static ──────────────────────────────────► on_static_served
+sync:     match sync route ─► do_check_sync ─► handler
+dispatch: do_check ─► on_request_accepted ─► queue ─► [worker]
+                                                        ├─ forward()  ─► on_forward ─► sibling pool
+                                                        └─ response   ─► on_response ─► on_pending_removed
+on death: ──────────────────────────────────────────────► on_worker_died
+```
+
+`do_check_sync`, `do_check`, and sync handlers may raise `RejectRequest` to stop processing
+(respond first). Any other exception anywhere in this flow is logged and returned as 500 —
+it cannot break the dispatcher loop.
+
 ## Post-Response Hook
 
 Override `on_response()` on the dispatcher to post-process after a response is sent to the client — e.g., forward data to another worker pool:
@@ -904,4 +937,4 @@ Extra `**kwargs` on `WorkerPool` are passed to worker constructor (accessible as
 
 - Python >= 3.10
 - POSIX system (Linux, macOS) — uses `select()` with `queue._reader`
-- [uhttp-server](https://github.com/cortexm/uhttp-server)
+- [uhttp-server](https://github.com/pavelrevak/uhttp-server)

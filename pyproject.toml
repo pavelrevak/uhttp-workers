@@ -21,8 +21,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pavelrevak/uhttp"
-Repository = "https://github.com/pavelrevak/uhttp"
+Homepage = "https://github.com/pavelrevak/uhttp-workers"
+Repository = "https://github.com/pavelrevak/uhttp-workers"
 
 [tool.setuptools_scm]
 fallback_version = "0.0.0"
