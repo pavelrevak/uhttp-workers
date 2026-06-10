@@ -132,6 +132,57 @@ class TestDispatcherLogName(unittest.TestCase):
         self.assertEqual(len(d.captured), 1)
 
 
+class TestDispatcherDoCheckSync(unittest.TestCase):
+    """do_check_sync gates matched sync routes."""
+
+    def _make(self, do_check_sync=None):
+        class TestDispatcher(Dispatcher):
+            @sync('/health')
+            def health(self, client, path_params):
+                client.respond({'status': 'ok'})
+
+        if do_check_sync is not None:
+            TestDispatcher.do_check_sync = do_check_sync
+        d = TestDispatcher.__new__(TestDispatcher)
+        d._sync_routes = []
+        d._static_routes = {}
+        d._pools = []
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+        d._build_sync_routes()
+        return d
+
+    def test_default_allows_handler(self):
+        d = self._make()
+        client = MockClient('GET', '/health')
+        d._http_request(client)
+        self.assertEqual(client.response_data, {'status': 'ok'})
+
+    def test_reject_blocks_handler(self):
+        def reject(self, client):
+            client.respond({'error': 'unauthorized'}, status=403)
+            raise RejectRequest()
+
+        d = self._make(do_check_sync=reject)
+        client = MockClient('GET', '/health')
+        d._http_request(client)
+        self.assertEqual(client.response_status, 403)
+        self.assertEqual(client.response_data, {'error': 'unauthorized'})
+
+    def test_pass_runs_handler(self):
+        calls = []
+
+        def check(self, client):
+            calls.append(client.path)
+
+        d = self._make(do_check_sync=check)
+        client = MockClient('GET', '/health')
+        d._http_request(client)
+        self.assertEqual(calls, ['/health'])
+        self.assertEqual(client.response_data, {'status': 'ok'})
+
+
 class TestDispatcherSyncRoutes(unittest.TestCase):
 
     def test_sync_handler_called(self):

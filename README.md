@@ -494,6 +494,21 @@ class MyDispatcher(_workers.Dispatcher):
 
 `do_check()` is only called for requests going to worker pools — static files and sync handlers are not affected.
 
+To gate **sync routes**, override `do_check_sync()` — the sync-handler counterpart, called
+after a sync route matches but before its handler runs:
+
+```python
+class MyDispatcher(_workers.Dispatcher):
+    def do_check_sync(self, client):
+        if client.path == '/status' and not _authorized(client):
+            client.respond({'error': 'unauthorized'}, status=401)
+            raise _workers.RejectRequest()
+```
+
+Same contract as `do_check`: respond and `raise RejectRequest` to block the handler (the
+request is then considered handled — no fall-through). Default no-op. Keeping the two checks
+separate avoids silently gating sync routes for dispatchers that only override `do_check`.
+
 ### Worker-Level Validation
 
 Override `do_check()` on the worker — runs before routing to handler:

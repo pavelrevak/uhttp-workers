@@ -1340,6 +1340,19 @@ class Dispatcher:
             client: HttpConnection from uhttp-server.
         """
 
+    def do_check_sync(self, client):
+        """Validation hook called before a matched sync route runs.
+
+        Sync handler counterpart to do_check (which only gates worker-pool
+        requests). Override to auth/validate sync routes. Send an error
+        response and raise RejectRequest to skip the handler; the request
+        is then considered handled (no fall-through to do_check/dispatch).
+        Default no-op. Static files and pool requests are unaffected.
+
+        Args:
+            client: HttpConnection from uhttp-server.
+        """
+
     def on_request_accepted(self, request_id, client, pool):
         """Attach app state to a request just before it is dispatched.
 
@@ -1439,6 +1452,12 @@ class Dispatcher:
                 continue
             path_params = _match_pattern(pattern, client.path)
             if path_params is not None:
+                # do_check_sync may reject (respond + raise) — the request
+                # is still handled, so don't fall through to do_check/pool
+                try:
+                    self.do_check_sync(client)
+                except RejectRequest:
+                    return True
                 handler(client, path_params)
                 return True
         return False
