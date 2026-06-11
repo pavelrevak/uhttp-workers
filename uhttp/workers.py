@@ -1590,35 +1590,51 @@ class Dispatcher:
         elif msg_type == MSG_SSE_OPEN:
             _, request_id, content_type, headers, cookies = msg
             pending = self._pending.get(request_id)
-            if pending is not None:
+            # `not pending.streaming` guards against a second open for the same
+            # request (re-opening an already-streaming client raises). Any
+            # failure to start the stream (client already responded / gone) is
+            # treated as a disconnect instead of crashing the dispatcher.
+            if pending is not None and not pending.streaming:
                 pending.streaming = True
-                pending.client.response_stream(
-                    content_type=content_type,
-                    headers=headers, cookies=cookies)
+                try:
+                    pending.client.response_stream(
+                        content_type=content_type,
+                        headers=headers, cookies=cookies)
+                except Exception:
+                    self._stream_disconnected(request_id, pending)
         elif msg_type == MSG_SSE_EVENT:
             _, request_id, data, event, event_id, retry = msg
             pending = self._pending.get(request_id)
             if pending is not None:
-                if event is None and event_id is None and retry is None:
-                    ok = pending.client.send_chunk(data)
-                else:
-                    ok = pending.client.send_event(
-                        data=data, event=event,
-                        event_id=event_id, retry=retry)
+                try:
+                    if event is None and event_id is None and retry is None:
+                        ok = pending.client.send_chunk(data)
+                    else:
+                        ok = pending.client.send_event(
+                            data=data, event=event,
+                            event_id=event_id, retry=retry)
+                except Exception:
+                    ok = False
                 if not ok:
                     self._stream_disconnected(request_id, pending)
         elif msg_type == MSG_NDJSON:
             _, request_id, obj = msg
             pending = self._pending.get(request_id)
             if pending is not None:
-                ok = pending.client.send_ndjson(obj)
+                try:
+                    ok = pending.client.send_ndjson(obj)
+                except Exception:
+                    ok = False
                 if not ok:
                     self._stream_disconnected(request_id, pending)
         elif msg_type == MSG_SSE_CLOSE:
             _, request_id = msg
             pending = self._pending.pop(request_id, None)
             if pending is not None:
-                pending.client.response_stream_end()
+                try:
+                    pending.client.response_stream_end()
+                except Exception:
+                    pass
                 self._notify_pending_removed(
                     request_id, pending, PENDING_STREAM_CLOSED)
         elif msg_type == MSG_RESPONSE:
@@ -1705,8 +1721,14 @@ class Dispatcher:
                 msg = self._response_queue.get_nowait()
             except _queue.Empty:
                 return
-
-            self._process_response(msg)
+            # A single bad message (e.g. a stream write to an already-closed
+            # client) must never take down the whole dispatcher loop.
+            try:
+                self._process_response(msg)
+            except Exception:
+                self.on_log(
+                    type(self).__name__, LOG_ERROR,
+                    f"_process_response failed:\n{_traceback.format_exc()}")
 
     def _expire_pending(self):
         """Timeout expired pending requests."""
@@ -1908,9 +1930,16 @@ class Dispatcher:
         while self._pending and _time.time() < deadline:
             try:
                 msg = self._response_queue.get(timeout=0.1)
-                self._process_response(msg)
             except _queue.Empty:
-                pass
+                continue
+            # Don't let a bad message abort the graceful drain.
+            try:
+                self._process_response(msg)
+            except Exception:
+                self.on_log(
+                    type(self).__name__, LOG_ERROR,
+                    f"_process_response failed during shutdown:\n"
+                    f"{_traceback.format_exc()}")
         # respond 503 to remaining pending
         for request_id, pending in self._pending.items():
             try:

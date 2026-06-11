@@ -1088,6 +1088,126 @@ class TestDispatcherSSE(unittest.TestCase):
         # should not raise, just ignore
 
 
+def _boom(*args, **kwargs):
+    raise OSError('broken pipe')
+
+
+class TestDispatcherStreamHardening(unittest.TestCase):
+    """Stream/response path survives client write failures — a write to an
+    already-closed client must disconnect cleanly, never crash the loop."""
+
+    def _make_dispatcher(self):
+        pool = WorkerPool(DummyWorker, routes=['/api/**'])
+        d = Dispatcher.__new__(Dispatcher)
+        d._sync_routes = []
+        d._static_routes = {}
+        d._pools = [pool]
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+        d._response_queue = mp.Queue()
+        d._log_is_tty = False
+        d.on_log = lambda *_: None
+        return d, pool
+
+    def test_sse_open_failure_disconnects(self):
+        d, pool = self._make_dispatcher()
+        pool.start(d._response_queue)
+        client = MockClient('GET', '/api/events')
+        client.response_stream = _boom  # opening the stream raises
+        pending = _PendingRequest(client, pool)
+        pending.worker_id = 0
+        d._pending[1] = pending
+        d._process_response(
+            (MSG_SSE_OPEN, 1, 'text/event-stream', None, None))
+        self.assertNotIn(1, d._pending)
+        self.assertEqual(
+            pool._control_queues[0].get(timeout=1), (CTL_DISCONNECT, 1))
+        pool.shutdown(timeout=2)
+
+    def test_sse_event_exception_disconnects(self):
+        d, pool = self._make_dispatcher()
+        pool.start(d._response_queue)
+        client = MockClient('GET', '/api/events')
+        client.send_event = _boom  # raises instead of returning False
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        pending.worker_id = 0
+        d._pending[1] = pending
+        d._process_response(
+            (MSG_SSE_EVENT, 1, {'x': 1}, 'ping', None, None))
+        self.assertNotIn(1, d._pending)
+        self.assertEqual(
+            pool._control_queues[0].get(timeout=1), (CTL_DISCONNECT, 1))
+        pool.shutdown(timeout=2)
+
+    def test_ndjson_exception_disconnects(self):
+        d, pool = self._make_dispatcher()
+        pool.start(d._response_queue)
+        client = MockClient('GET', '/api/stream')
+        client.send_ndjson = _boom
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        pending.worker_id = 0
+        d._pending[1] = pending
+        d._process_response((MSG_NDJSON, 1, {'x': 1}))
+        self.assertNotIn(1, d._pending)
+        self.assertEqual(
+            pool._control_queues[0].get(timeout=1), (CTL_DISCONNECT, 1))
+        pool.shutdown(timeout=2)
+
+    def test_sse_close_exception_swallowed(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/events')
+        client.response_stream_end = _boom
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True
+        removed = []
+        d.on_pending_removed = lambda rid, p, reason: removed.append(reason)
+        d._pending[1] = pending
+        d._process_response((MSG_SSE_CLOSE, 1))  # must not raise
+        self.assertNotIn(1, d._pending)
+        self.assertEqual(removed, [PENDING_STREAM_CLOSED])
+
+    def test_duplicate_sse_open_ignored(self):
+        d, pool = self._make_dispatcher()
+        client = MockClient('GET', '/api/events')
+        pending = _PendingRequest(client, pool)
+        pending.streaming = True  # already streaming
+        client.response_stream = _boom  # would raise if re-opened
+        d._pending[1] = pending
+        d._process_response(
+            (MSG_SSE_OPEN, 1, 'text/event-stream', None, None))
+        self.assertIn(1, d._pending)  # left intact, no second open
+
+    def test_process_responses_survives_bad_message(self):
+        d, pool = self._make_dispatcher()
+        logs = []
+        d.on_log = lambda name, level, msg: logs.append((level, msg))
+        client = MockClient('GET', '/api/x')
+        client.respond = _boom  # raises when dispatcher delivers the response
+        pending = _PendingRequest(client, pool)
+        d._pending[1] = pending
+
+        # deterministic queue: one bad message then empty (avoids the
+        # mp.Queue put/get_nowait feeder-thread race)
+        class _OneShot:
+            def __init__(self, items):
+                self._items = list(items)
+
+            def get_nowait(self):
+                if self._items:
+                    return self._items.pop(0)
+                raise queue.Empty
+
+        d._response_queue = _OneShot([
+            (MSG_RESPONSE, 1, Response(1, data={'ok': True}, status=200))])
+        d._process_responses()  # must not raise, must drain
+        self.assertNotIn(1, d._pending)
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0][0], LOG_ERROR)
+
+
 class TestDispatcherPendingRemoved(unittest.TestCase):
     """Tests for the on_pending_removed lifecycle hook."""
 
