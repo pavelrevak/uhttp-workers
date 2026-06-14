@@ -207,6 +207,36 @@ Override **`on_static_served(client, file_path, status)`** for an access log —
 on every 200, and on the 404 of an authoritative mount (`status` is `200` or `404`).
 Exceptions raised by the hook are logged and swallowed.
 
+## Multiple Servers
+
+One dispatcher can listen on several sockets at once — e.g. HTTP and HTTPS — via the
+`servers` parameter. Each entry is a dict of `HttpServer` kwargs plus an optional `name`:
+
+```python
+dispatcher = MyDispatcher(
+    servers=[
+        {'name': 'public', 'port': 80},
+        {'name': 'public', 'port': 443, 'ssl_context': ctx},
+        {'name': 'internal', 'address': '10.0.0.5', 'port': 8080},
+    ],
+    pools=[...],
+)
+```
+
+All servers share the same routing, pools, sync handlers, and static mounts. Servers that
+share a `name` form one group (here `public` = HTTP + HTTPS). The worker can tell which
+server a request arrived on via **`request.server`** (the name, or `None` for an unnamed /
+legacy single server):
+
+```python
+@_workers.api('/whoami', 'GET')
+def whoami(self, request):
+    return {'via': request.server}   # 'public' / 'internal' / None
+```
+
+When `servers` is omitted, the dispatcher builds a single server from
+`port`/`address`/`ssl_context`/**kwargs (fully backward compatible).
+
 ## Sync Handlers
 
 Lightweight handlers that run directly in the dispatcher process — no queue overhead. Define them as methods on the dispatcher class with the `@sync` decorator:
@@ -906,8 +936,9 @@ Errors are logged automatically:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `port` | 8080 | Listen port |
-| `address` | `'0.0.0.0'` | Listen address |
+| `port` | 8080 | Listen port (single-server convenience) |
+| `address` | `'0.0.0.0'` | Listen address (single-server convenience) |
+| `servers` | `None` | List of per-server dicts for multiple listeners (see below) |
 | `pools` | `[]` | List of `WorkerPool` instances |
 | `static_routes` | `{}` | URL prefix → filesystem path |
 | `shutdown_timeout` | 10 | Seconds to wait on shutdown |

@@ -883,6 +883,68 @@ class TestDispatcherRequestAccepted(unittest.TestCase):
         self.assertIsNone(req.context)
 
 
+class TestDispatcherMultiServer(unittest.TestCase):
+    """Multi-server config normalization + Request.server stamping."""
+
+    def test_legacy_single_server_spec(self):
+        specs = Dispatcher._normalize_servers(None, '0.0.0.0', 8080, {})
+        self.assertEqual(
+            specs, [(None, {'address': '0.0.0.0', 'port': 8080})])
+
+    def test_legacy_spec_includes_kwargs(self):
+        specs = Dispatcher._normalize_servers(
+            None, '127.0.0.1', 443, {'ssl_context': 'CTX'})
+        self.assertEqual(specs, [
+            (None, {'address': '127.0.0.1', 'port': 443,
+                    'ssl_context': 'CTX'})])
+
+    def test_servers_list_extracts_name(self):
+        servers = [
+            {'name': 'public', 'port': 80},
+            {'name': 'internal', 'address': '10.0.0.1', 'port': 81}]
+        specs = Dispatcher._normalize_servers(servers, '0.0.0.0', 8080, {})
+        self.assertEqual(specs, [
+            ('public', {'port': 80}),
+            ('internal', {'address': '10.0.0.1', 'port': 81})])
+
+    def test_servers_list_does_not_mutate_caller(self):
+        servers = [{'name': 'public', 'port': 80}]
+        Dispatcher._normalize_servers(servers, '0.0.0.0', 8080, {})
+        self.assertEqual(servers, [{'name': 'public', 'port': 80}])
+
+    def test_unnamed_server_in_list(self):
+        specs = Dispatcher._normalize_servers(
+            [{'port': 80}], '0.0.0.0', 8080, {})
+        self.assertEqual(specs, [(None, {'port': 80})])
+
+    def _stub_pool(self):
+        return types.SimpleNamespace(
+            name='stub', _routes=None, is_degraded=False,
+            alive_count=1, request_queue=mp.Queue())
+
+    def _make_dispatcher(self, pool):
+        d = Dispatcher.__new__(Dispatcher)
+        d._pools = [pool]
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+        return d
+
+    def test_request_server_stamped(self):
+        pool = self._stub_pool()
+        d = self._make_dispatcher(pool)
+        d._dispatch_to_pool(MockClient('GET', '/x'), 'public')
+        req = pool.request_queue.get(timeout=2)
+        self.assertEqual(req.server, 'public')
+
+    def test_request_server_default_none(self):
+        pool = self._stub_pool()
+        d = self._make_dispatcher(pool)
+        d._dispatch_to_pool(MockClient('GET', '/x'))
+        req = pool.request_queue.get(timeout=2)
+        self.assertIsNone(req.server)
+
+
 class TestDispatcherRoutePriority(unittest.TestCase):
     """Test that static > sync > pool routing order is respected."""
 
@@ -1327,7 +1389,7 @@ class TestDispatcherPendingRemoved(unittest.TestCase):
             def shutdown(self, timeout):
                 pass
 
-        d._http_server = FakeHttpServer()
+        d._http_servers = [('', FakeHttpServer())]
         d._pools = [FakePool()]
         d._shutdown_timeout = 0.0  # skip drain loop immediately
 

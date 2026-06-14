@@ -227,18 +227,21 @@ class Request:
             dispatcher could not resolve the address (e.g., in tests).
         context: App state attached by Dispatcher.on_request_accepted,
             serialized to the worker. None unless that hook returns a value.
+        server: Name of the server (listener) the request arrived on, or
+            None for an unnamed/legacy single server. Servers sharing a
+            name form one group.
     """
 
     __slots__ = (
         'request_id', 'method', 'path', 'query',
         'data', 'headers', 'content_type', 'path_params',
-        'remote_address', 'context',
+        'remote_address', 'context', 'server',
         '_cookies', '_response_queue')
 
     def __init__(
             self, request_id, method, path, query=None,
             data=None, headers=None, content_type=None,
-            remote_address=None, context=None):
+            remote_address=None, context=None, server=None):
         self.request_id = request_id
         self.method = method
         self.path = path
@@ -249,6 +252,7 @@ class Request:
         self.path_params = {}
         self.remote_address = remote_address
         self.context = context
+        self.server = server
         self._cookies = None
         self._response_queue = None
 
@@ -1207,12 +1211,19 @@ class Dispatcher:
     def __init__(
             self, port=8080, address='0.0.0.0', pools=None,
             static_routes=None, shutdown_timeout=10,
-            max_pending=1000, log_level=LOG_INFO, **kwargs):
+            max_pending=1000, log_level=LOG_INFO, servers=None, **kwargs):
         """Initialize dispatcher.
 
         Args:
-            port: Listen port.
-            address: Listen address.
+            port: Listen port (single-server convenience; ignored if
+                `servers` is given).
+            address: Listen address (single-server convenience).
+            servers: Optional list of per-server dicts of HttpServer kwargs
+                plus an optional `name` (e.g.
+                [{'name': 'public', 'port': 443, 'ssl_context': ctx},
+                 {'name': 'public', 'port': 80}]). Servers sharing a name
+                form one group. None = a single server built from
+                `port`/`address`/`ssl_context`/**kwargs (backward compatible).
             pools: List of WorkerPool instances.
             static_routes: Dict of URL prefix -> filesystem path, or
                 -> {'path': ..., 'headers': {...}, 'authoritative': bool}.
@@ -1247,8 +1258,9 @@ class Dispatcher:
                     _os.path.expanduser(path))
         self._shutdown_timeout = shutdown_timeout
         self._max_pending = max_pending
-        self._server_kwargs = kwargs
-        self._http_server = None
+        self._server_specs = self._normalize_servers(
+            servers, address, port, kwargs)
+        self._http_servers = []  # [(name, HttpServer), ...], built in run()
         self._response_queue = _mp.Queue()
         self._pending = {}
         self._next_request_id = 0
@@ -1263,6 +1275,23 @@ class Dispatcher:
             level=log_level)
         self.log.name = self._format_log_name()
         self._build_sync_routes()
+
+    @staticmethod
+    def _normalize_servers(servers, address, port, kwargs):
+        """Build [(name, http_server_kwargs), ...] from config.
+
+        None => one server from the legacy address/port/**kwargs. A list =>
+        one entry per dict; `name` is popped out (default None), the rest are
+        HttpServer kwargs. The caller's dicts are not mutated.
+        """
+        if servers is None:
+            return [(None, {'address': address, 'port': port, **kwargs})]
+        specs = []
+        for spec in servers:
+            spec = dict(spec)
+            name = spec.pop('name', None)
+            specs.append((name, spec))
+        return specs
 
     def _format_log_name(self):
         """Resolve the logger name from the LOG_NAME template.
@@ -1508,7 +1537,7 @@ class Dispatcher:
                 return pool
         return default_pool
 
-    def _dispatch_to_pool(self, client):
+    def _dispatch_to_pool(self, client, server_name=None):
         """Send request to matching worker pool."""
         pool = self._find_pool(client.path)
         if pool is None:
@@ -1540,15 +1569,18 @@ class Dispatcher:
             headers=dict(client.headers),
             content_type=client.content_type,
             remote_address=client.remote_address,
-            context=context))
+            context=context,
+            server=server_name))
 
-    def _http_request(self, client):
+    def _http_request(self, client, server_name=None):
         """Process incoming HTTP request: static -> sync -> do_check -> pool.
 
-        RejectRequest (from do_check or a handler that already responded)
-        stops processing cleanly. Any other exception — in a static mount,
-        sync handler, do_check_sync, do_check, or dispatch — is logged and
-        turned into a 500 so a buggy hook/handler can't break the event loop.
+        `server_name` is the name of the server (listener) the request
+        arrived on, threaded to the worker via Request.server. RejectRequest
+        (from do_check or a handler that already responded) stops processing
+        cleanly. Any other exception — in a static mount, sync handler,
+        do_check_sync, do_check, or dispatch — is logged and turned into a
+        500 so a buggy hook/handler can't break the event loop.
         """
         try:
             if self._serve_static(client):
@@ -1556,7 +1588,7 @@ class Dispatcher:
             if self._handle_sync(client):
                 return
             self.do_check(client)
-            self._dispatch_to_pool(client)
+            self._dispatch_to_pool(client, server_name)
         except RejectRequest:
             return
         except Exception:
@@ -1864,10 +1896,11 @@ class Dispatcher:
 
     def _wait_events(self):
         """Single iteration of the main event loop."""
-        waiting_sockets = self._http_server.read_sockets + [
-            self._response_queue._reader] + list(self._readers)
-        write_sockets = (self._http_server.write_sockets
-            + list(self._writers))
+        waiting_sockets = [self._response_queue._reader] + list(self._readers)
+        write_sockets = list(self._writers)
+        for _, server in self._http_servers:
+            waiting_sockets += server.read_sockets
+            write_sockets += server.write_sockets
         read_events, write_events, _ = _select.select(
             waiting_sockets, write_sockets, [], self.SELECT_TIMEOUT)
         # process responses from workers
@@ -1884,15 +1917,18 @@ class Dispatcher:
         for fd in read_events:
             if fd in self._readers:
                 self._readers[fd](fd)
-        # filter custom fds before passing to http server
+        # filter custom fds before passing to http servers
         http_read = [s for s in read_events if s not in self._readers]
         http_write = [s for s in write_events if s not in self._writers]
-        # process HTTP events
+        # process HTTP events — each server picks its own sockets out of the
+        # shared ready set (sets give O(1) membership in process_events)
         if http_read or http_write:
-            client = self._http_server.process_events(
-                http_read, http_write)
-            if client:
-                self._http_request(client)
+            read_set = set(http_read)
+            write_set = set(http_write)
+            for name, server in self._http_servers:
+                client = server.process_events(read_set, write_set)
+                if client:
+                    self._http_request(client, name)
         # periodic maintenance
         self._check_all_workers()
         if not read_events and not write_events:
@@ -1905,10 +1941,16 @@ class Dispatcher:
 
         Blocks until SIGTERM/SIGINT, then performs graceful shutdown.
         """
-        self._http_server = _uhttp_server.HttpServer(
-            address=self._address,
-            port=self._port,
-            **self._server_kwargs)
+        self._http_servers = []
+        try:
+            for name, server_kwargs in self._server_specs:
+                self._http_servers.append(
+                    (name, _uhttp_server.HttpServer(**server_kwargs)))
+        except Exception:
+            # close any already-bound servers on a partial-bind failure
+            for _, server in self._http_servers:
+                server.close()
+            raise
         self._running = True
         # start all pools
         for pool in self._pools:
@@ -1924,7 +1966,8 @@ class Dispatcher:
     def _shutdown(self):
         """Graceful shutdown."""
         # stop accepting connections
-        self._http_server.close()
+        for _, server in self._http_servers:
+            server.close()
         # drain remaining responses
         deadline = _time.time() + self._shutdown_timeout
         while self._pending and _time.time() < deadline:
