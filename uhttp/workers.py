@@ -47,6 +47,10 @@ PENDING_WORKER_DIED = 'WORKER_DIED'
 # Sentinel for deferred response
 DEFERRED = object()
 
+# Sentinel for "match any server" in _find_pool (worker forwards have no
+# inbound server, so they must bypass the per-server endpoint filter)
+_ANY_SERVER = object()
+
 # Log levels
 LOG_CRITICAL = 50
 LOG_ERROR = 40
@@ -114,7 +118,7 @@ def api(pattern, *methods):
     return decorator
 
 
-def sync(pattern, *methods):
+def sync(pattern, *methods, servers=None):
     """Decorator to register a method as sync handler on Dispatcher.
 
     Sync handlers run directly in dispatcher process.
@@ -123,10 +127,12 @@ def sync(pattern, *methods):
     Args:
         pattern: URL pattern with optional parameters (e.g., '/health')
         *methods: HTTP methods to accept (e.g., 'GET', 'POST'). None = all.
+        servers: List of server names that expose this route. None = all.
     """
     def decorator(func):
         func._sync_pattern = pattern
         func._sync_methods = list(methods) if methods else None
+        func._sync_servers = set(servers) if servers is not None else None
         return func
     return decorator
 
@@ -894,7 +900,7 @@ class WorkerPool:
             log_level=LOG_WARNING, max_restarts=10,
             restart_window=300, queue_warning=100,
             recovery_interval=None, permanent_failure_exitcode=None,
-            **kwargs):
+            servers=None, **kwargs):
         """Initialize worker pool.
 
         Args:
@@ -918,6 +924,8 @@ class WorkerPool:
                 worker (missing license, bad config, ...). A worker that
                 dies with this code is parked — not restarted, not counted
                 toward max_restarts. None (default) disables parking.
+            servers: List of server names that expose this pool (matching
+                Dispatcher `servers` names). None (default) = all servers.
             **kwargs: Extra arguments passed to worker constructor.
         """
         self._worker_class = worker_class
@@ -930,6 +938,7 @@ class WorkerPool:
         self._max_restarts = max_restarts
         self._restart_window = restart_window
         self._queue_warning = queue_warning
+        self._servers = set(servers) if servers is not None else None
         self._recovery_interval = recovery_interval
         self._permanent_failure_exitcode = permanent_failure_exitcode
         self._kwargs = kwargs
@@ -1105,6 +1114,11 @@ class WorkerPool:
         return self._name
 
     @property
+    def servers(self):
+        """Set of server names exposing this pool, or None for all."""
+        return self._servers
+
+    @property
     def num_workers(self):
         """Configured number of worker slots."""
         return self._num_workers
@@ -1242,6 +1256,7 @@ class Dispatcher:
         self._static_routes = {}
         self._static_headers = {}
         self._static_authoritative = {}
+        self._static_servers = {}
         if static_routes:
             for prefix, value in static_routes.items():
                 if isinstance(value, dict):
@@ -1252,6 +1267,9 @@ class Dispatcher:
                     self._static_headers[prefix] = value.get('headers')
                     self._static_authoritative[prefix] = value.get(
                         'authoritative', False)
+                    srv = value.get('servers')
+                    self._static_servers[prefix] = (
+                        set(srv) if srv is not None else None)
                 else:
                     path = value
                 self._static_routes[prefix] = _os.path.abspath(
@@ -1293,6 +1311,24 @@ class Dispatcher:
             specs.append((name, spec))
         return specs
 
+    def _unknown_server_tags(self):
+        """Endpoint `servers` tags that match no configured server name.
+
+        A typo'd tag would silently 404 forever; run() warns about these.
+        """
+        known = {name for name, _ in self._server_specs if name is not None}
+        tags = set()
+        for pool in self._pools:
+            if pool._servers:
+                tags |= pool._servers
+        for _pattern, _methods, servers, _handler in self._sync_routes:
+            if servers:
+                tags |= servers
+        for servers in self._static_servers.values():
+            if servers:
+                tags |= servers
+        return tags - known
+
     def _format_log_name(self):
         """Resolve the logger name from the LOG_NAME template.
 
@@ -1317,6 +1353,7 @@ class Dispatcher:
                     self._sync_routes.append((
                         val._sync_pattern,
                         val._sync_methods,
+                        getattr(val, '_sync_servers', None),
                         bound))
 
     def register_reader(self, fd, callback):
@@ -1446,15 +1483,19 @@ class Dispatcher:
                 f"{_traceback.format_exc()}")
             return None
 
-    def _serve_static(self, client):
+    def _serve_static(self, client, server_name=None):
         """Try to serve static file. Returns True if served.
 
         An authoritative mount owns its prefix: a missing file or blocked
         traversal under it returns 404 here (no fall-through to pools).
+        Mounts tagged with `servers` only apply on those server names.
         """
         path = client.path
         for prefix, base_path in self._static_routes.items():
             if not path.startswith(prefix):
+                continue
+            mount_servers = self._static_servers.get(prefix)
+            if mount_servers is not None and server_name not in mount_servers:
                 continue
             authoritative = self._static_authoritative.get(prefix, False)
             rel_path = path[len(prefix):]
@@ -1509,9 +1550,15 @@ class Dispatcher:
             status: 200 or 404.
         """
 
-    def _handle_sync(self, client):
-        """Try sync route handlers. Returns True if handled."""
-        for pattern, methods, handler in self._sync_routes:
+    def _handle_sync(self, client, server_name=None):
+        """Try sync route handlers. Returns True if handled.
+
+        Routes tagged with `servers` only match requests arriving on one of
+        those server names; untagged routes match any server.
+        """
+        for pattern, methods, servers, handler in self._sync_routes:
+            if servers is not None and server_name not in servers:
+                continue
             if methods and client.method not in methods:
                 continue
             path_params = _match_pattern(pattern, client.path)
@@ -1526,10 +1573,19 @@ class Dispatcher:
                 return True
         return False
 
-    def _find_pool(self, path):
-        """Find matching worker pool for path, or fallback pool."""
+    def _find_pool(self, path, server_name=_ANY_SERVER):
+        """Find matching worker pool for path, or fallback pool.
+
+        When server_name is a real name (inbound request), pools tagged for
+        other servers are skipped. _ANY_SERVER (default, used by worker
+        forwards) disables the per-server filter.
+        """
         default_pool = None
         for pool in self._pools:
+            if (server_name is not _ANY_SERVER
+                    and pool._servers is not None
+                    and server_name not in pool._servers):
+                continue
             if pool._routes is None:
                 default_pool = pool
                 continue
@@ -1539,7 +1595,7 @@ class Dispatcher:
 
     def _dispatch_to_pool(self, client, server_name=None):
         """Send request to matching worker pool."""
-        pool = self._find_pool(client.path)
+        pool = self._find_pool(client.path, server_name)
         if pool is None:
             client.respond({'error': 'Not found'}, status=404)
             return
@@ -1583,9 +1639,9 @@ class Dispatcher:
         500 so a buggy hook/handler can't break the event loop.
         """
         try:
-            if self._serve_static(client):
+            if self._serve_static(client, server_name):
                 return
-            if self._handle_sync(client):
+            if self._handle_sync(client, server_name):
                 return
             self.do_check(client)
             self._dispatch_to_pool(client, server_name)
@@ -1951,6 +2007,11 @@ class Dispatcher:
             for _, server in self._http_servers:
                 server.close()
             raise
+        unknown = self._unknown_server_tags()
+        if unknown:
+            self.on_log(
+                type(self).__name__, LOG_WARNING,
+                f"endpoint server tags match no server: {sorted(unknown)}")
         self._running = True
         # start all pools
         for pool in self._pools:

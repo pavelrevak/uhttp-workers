@@ -237,6 +237,31 @@ def whoami(self, request):
 When `servers` is omitted, the dispatcher builds a single server from
 `port`/`address`/`ssl_context`/**kwargs (fully backward compatible).
 
+### Per-Server Endpoints (server groups)
+
+Pools, sync routes, and static mounts can be **scoped to specific servers** with a
+`servers=[...]` tag (matching server names). A request only matches endpoints exposed on
+the server it arrived on; untagged endpoints are exposed everywhere. Servers sharing a
+name form a group, so a tag like `['public']` covers both the HTTP and HTTPS `public`
+listeners:
+
+```python
+WorkerPool(PublicApi,   routes=['/api/**'],   servers=['public'])
+WorkerPool(AdminApi,    routes=['/admin/**'], servers=['internal'])
+
+@_workers.sync('/metrics', servers=['internal'])   # internal listeners only
+def metrics(self, client, path_params): ...
+
+static_routes={'/assets/': {'path': '...', 'servers': ['public']}}
+```
+
+A request for an endpoint not exposed on its server simply gets a **404** (the endpoint
+is invisible there). The same prefix can even route to different pools per server — tag
+two pools `routes=['/api/**']` with `servers=['public']` and `servers=['internal']`.
+
+Worker forwards (`forward()`) bypass this filter (they have no inbound server). A tag that
+matches no configured server name logs a `WARNING` at startup (it would 404 forever).
+
 ## Sync Handlers
 
 Lightweight handlers that run directly in the dispatcher process — no queue overhead. Define them as methods on the dispatcher class with the `@sync` decorator:

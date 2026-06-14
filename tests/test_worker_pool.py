@@ -57,6 +57,16 @@ class _AliveWorker:
         pass
 
 
+class TestWorkerPoolServers(unittest.TestCase):
+
+    def test_servers_default_none(self):
+        self.assertIsNone(WorkerPool(DummyWorker).servers)
+
+    def test_servers_stored_as_set(self):
+        pool = WorkerPool(DummyWorker, servers=['public', 'internal'])
+        self.assertEqual(pool.servers, {'public', 'internal'})
+
+
 class TestWorkerPoolMatches(unittest.TestCase):
 
     def test_glob_match(self):

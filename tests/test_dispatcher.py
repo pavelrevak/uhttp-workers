@@ -330,6 +330,7 @@ class TestDispatcherStaticFiles(unittest.TestCase):
         d._static_routes = {}
         d._static_headers = {}
         d._static_authoritative = {}
+        d._static_servers = {}
         if static_routes:
             for prefix, value in static_routes.items():
                 if isinstance(value, dict):
@@ -337,6 +338,9 @@ class TestDispatcherStaticFiles(unittest.TestCase):
                     d._static_headers[prefix] = value.get('headers')
                     d._static_authoritative[prefix] = value.get(
                         'authoritative', False)
+                    srv = value.get('servers')
+                    d._static_servers[prefix] = (
+                        set(srv) if srv is not None else None)
                 else:
                     path = value
                 d._static_routes[prefix] = os.path.abspath(path)
@@ -442,6 +446,25 @@ class TestDispatcherStaticFiles(unittest.TestCase):
         d = Dispatcher(static_routes={'/s/': '/tmp'})
         self.assertNotIn('/s/', d._static_headers)
         self.assertEqual(d._static_routes['/s/'], os.path.abspath('/tmp'))
+
+    def test_mount_served_on_tagged_server(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, 'a.txt'), 'w') as f:
+                f.write('x')
+            d = self._make_dispatcher(
+                {'/s/': {'path': tmpdir, 'servers': ['public']}})
+            client = MockClient('GET', '/s/a.txt')
+            self.assertTrue(d._serve_static(client, 'public'))
+
+    def test_mount_skipped_on_other_server(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, 'a.txt'), 'w') as f:
+                f.write('x')
+            d = self._make_dispatcher(
+                {'/s/': {'path': tmpdir, 'servers': ['public']}})
+            client = MockClient('GET', '/s/a.txt')
+            # tagged for 'public' only — on 'internal' it falls through
+            self.assertFalse(d._serve_static(client, 'internal'))
 
     def test_non_authoritative_missing_falls_through(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -843,7 +866,7 @@ class TestDispatcherRequestAccepted(unittest.TestCase):
 
     def _stub_pool(self):
         return types.SimpleNamespace(
-            name='stub', _routes=None, is_degraded=False,
+            name='stub', _routes=None, _servers=None, is_degraded=False,
             alive_count=1, request_queue=mp.Queue())
 
     def _make_dispatcher(self, pool):
@@ -919,7 +942,7 @@ class TestDispatcherMultiServer(unittest.TestCase):
 
     def _stub_pool(self):
         return types.SimpleNamespace(
-            name='stub', _routes=None, is_degraded=False,
+            name='stub', _routes=None, _servers=None, is_degraded=False,
             alive_count=1, request_queue=mp.Queue())
 
     def _make_dispatcher(self, pool):
@@ -945,6 +968,83 @@ class TestDispatcherMultiServer(unittest.TestCase):
         self.assertIsNone(req.server)
 
 
+class TestDispatcherServerFilter(unittest.TestCase):
+    """Phase 2: per-server endpoint scoping via `servers` tags."""
+
+    def _dispatcher(self, pools):
+        d = Dispatcher.__new__(Dispatcher)
+        d._pools = pools
+        d._pending = {}
+        d._max_pending = 1000
+        d._next_request_id = 0
+        return d
+
+    def test_find_pool_routes_by_server(self):
+        pub = WorkerPool(DummyWorker, routes=['/api/**'], servers=['public'])
+        intl = WorkerPool(
+            DummyWorker, routes=['/api/**'], servers=['internal'])
+        d = self._dispatcher([pub, intl])
+        self.assertIs(d._find_pool('/api/x', 'public'), pub)
+        self.assertIs(d._find_pool('/api/x', 'internal'), intl)
+
+    def test_find_pool_untagged_matches_any_server(self):
+        pool = WorkerPool(DummyWorker, routes=['/api/**'])
+        d = self._dispatcher([pool])
+        self.assertIs(d._find_pool('/api/x', 'public'), pool)
+        self.assertIs(d._find_pool('/api/x', 'whatever'), pool)
+
+    def test_find_pool_tagged_skipped_for_other_server(self):
+        pool = WorkerPool(DummyWorker, routes=['/api/**'], servers=['public'])
+        d = self._dispatcher([pool])
+        self.assertIsNone(d._find_pool('/api/x', 'internal'))
+
+    def test_forward_bypasses_server_filter(self):
+        # _find_pool default (_ANY_SERVER) — worker forwards have no inbound
+        # server and must still reach a server-tagged pool
+        pool = WorkerPool(DummyWorker, routes=['/api/**'], servers=['public'])
+        d = self._dispatcher([pool])
+        self.assertIs(d._find_pool('/api/x'), pool)
+
+    def test_dispatch_off_server_returns_404(self):
+        pool = WorkerPool(DummyWorker, routes=['/api/**'], servers=['public'])
+        d = self._dispatcher([pool])
+        client = MockClient('GET', '/api/x')
+        d._dispatch_to_pool(client, 'internal')
+        self.assertEqual(client.response_status, 404)
+
+    def test_sync_route_server_filter(self):
+        class D(Dispatcher):
+            @sync('/metrics', servers=['internal'])
+            def metrics(self, client, path_params):
+                client.respond({'m': 1})
+
+        d = D.__new__(D)
+        d._sync_routes = []
+        d._build_sync_routes()
+        self.assertTrue(d._handle_sync(MockClient('GET', '/metrics'),
+                                       'internal'))
+        self.assertFalse(d._handle_sync(MockClient('GET', '/metrics'),
+                                        'public'))
+
+    def test_unknown_server_tags_detected(self):
+        d = Dispatcher.__new__(Dispatcher)
+        d._server_specs = [('public', {}), ('internal', {})]
+        d._pools = [
+            WorkerPool(DummyWorker, servers=['public', 'typo']),
+        ]
+        d._sync_routes = []
+        d._static_servers = {'/s/': {'internal'}, '/x/': {'ghost'}}
+        self.assertEqual(d._unknown_server_tags(), {'typo', 'ghost'})
+
+    def test_unknown_server_tags_empty_when_all_known(self):
+        d = Dispatcher.__new__(Dispatcher)
+        d._server_specs = [('public', {})]
+        d._pools = [WorkerPool(DummyWorker, servers=['public'])]
+        d._sync_routes = []
+        d._static_servers = {}
+        self.assertEqual(d._unknown_server_tags(), set())
+
+
 class TestDispatcherRoutePriority(unittest.TestCase):
     """Test that static > sync > pool routing order is respected."""
 
@@ -964,6 +1064,7 @@ class TestDispatcherRoutePriority(unittest.TestCase):
             d._static_routes = {'/static/': os.path.abspath(tmpdir)}
             d._static_headers = {}
             d._static_authoritative = {}
+            d._static_servers = {}
             d._pools = []
             d._pending = {}
             d._max_pending = 1000
